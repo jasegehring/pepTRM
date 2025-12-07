@@ -1,0 +1,67 @@
+# RecursivePeptide Default Configuration
+
+model:
+  hidden_dim: 256
+  num_encoder_layers: 2
+  num_decoder_layers: 2
+  num_heads: 4
+  max_peaks: 100
+  max_seq_len: 25
+  max_mass: 2000.0
+  vocab_size: 24  # 20 AA + 4 special tokens
+  num_supervision_steps: 8
+  num_latent_steps: 4  # MVP: 4 instead of 6
+  dropout: 0.1
+
+data:
+  # Peptide generation
+  min_length: 7
+  max_length: 10  # Start easy
+
+  # Spectrum generation
+  ion_types: ['b', 'y']
+  include_neutral_losses: false
+
+  # Initial difficulty (clean synthetic)
+  noise_peaks: 0
+  peak_dropout: 0.0
+  mass_error_ppm: 0.0
+  intensity_variation: 0.0
+
+  # Charge distribution
+  charge_distribution:
+    2: 0.7
+    3: 0.25
+    4: 0.05
+
+training:
+  # Optimization
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  batch_size: 64
+  max_steps: 50000
+  warmup_steps: 1000
+
+  # Loss weights
+  ce_weight: 1.0
+  spectrum_weight: 0.0  # Controlled by curriculum
+  iteration_weights: 'linear'
+  label_smoothing: 0.0
+
+  # Curriculum learning
+  use_curriculum: true
+
+  # EMA
+  use_ema: true
+  ema_decay: 0.999
+
+  # Logging
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 5000
+
+  # Paths
+  checkpoint_dir: 'checkpoints'
+
+  # Device
+  device: 'cpu'  # Will auto-detect CUDA
