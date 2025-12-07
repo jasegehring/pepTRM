@@ -33,7 +33,7 @@ env/
 *~
 
 # Project specific
-data/
+/data/
 checkpoints/
 wandb/
 *.pt
