@@ -6,7 +6,54 @@ This file tracks ideas and enhancements to implement after the baseline training
 
 ## High Priority 🔴
 
-### 1. Add Precursor Noise to Synthetic Data
+### 1. Add Protonation to Fragment Ions (Critical Physics Bug!)
+**Status**: Not implemented
+**Priority**: **CRITICAL**
+**Effort**: 5 minutes
+
+**Problem**: MS detectors measure **ionized** fragments, not neutral masses. Our synthetic data generates neutral masses, creating a systematic ~1 Da offset from real data.
+
+**Physics**:
+- b-ions: Detector sees `[M+H]+` = sum(residues) + **PROTON_MASS** (~1.007 Da)
+- y-ions: Detector sees `[M+H2O+H]+` = sum(residues) + WATER_MASS + **PROTON_MASS**
+
+**Current Code** (`src/data/synthetic.py`):
+```python
+# Line 115 (b-ions) - WRONG
+mass = cumulative  # Neutral mass
+
+# Line 145 (y-ions) - WRONG
+mass = cumulative  # Neutral mass (already has H2O, but missing H+)
+```
+
+**Proposed Fix**:
+```python
+# Line 115 (b-ions)
+mass = cumulative + PROTON_MASS  # [M+H]+
+
+# Line 145 (y-ions)
+mass = cumulative + PROTON_MASS  # [M+H2O+H]+
+```
+
+**Impact**:
+- **Internally consistent now**: Both synthetic data AND loss function use neutral masses, so training works
+- **Real data will fail**: Real .mzML files have +1 Da offset
+- **Must fix before real data integration**
+
+**Also update** `src/training/losses.py:compute_theoretical_peaks()`:
+```python
+# Line 156 (b-ions)
+b_ions = torch.cumsum(residue_masses, dim=1)[:, :-1] + PROTON_MASS
+
+# Line 159-162 (y-ions)
+y_ions = torch.flip(...) + WATER_MASS + PROTON_MASS
+```
+
+**Why it matters**: Without this, model trained on synthetic won't transfer to real data (systematic 1 Da error).
+
+---
+
+### 2. Add Precursor Noise to Synthetic Data
 **Status**: Not implemented
 **Priority**: High
 **Effort**: 5 minutes
@@ -164,18 +211,122 @@ improvement_metrics = {
 
 ---
 
-### 6. I/L Ambiguity Handling
-**Status**: Detected but not trained
-**Priority**: Low (research question)
+### 6. I/L Ambiguity Handling (Physics Constraint)
+**Status**: Detected but not handled
+**Priority**: Medium (affects evaluation metrics)
 
-**Current behavior**: Model must choose between I and L (identical mass = 113.084 Da)
+**Problem**: Isoleucine (I) and Leucine (L) have **identical mass** (113.084 Da). Mass spectrometry **cannot distinguish them**. Current training penalizes the model for "guessing wrong" on an impossible task.
 
-**Ideas to explore**:
-1. **Collapse I/L to single token** `[I/L]` (27-token vocab instead of 28)
-2. **Treat as multi-label** (allow probability to split between I and L)
-3. **Add [UNK-IsobaricIL] token** for ambiguous positions
+**Physics**: `I` and `L` fragments produce identical m/z peaks. Only database search or additional experiments (MS3, retention time) can distinguish them.
 
-**Validation**: On real data, check if model incorrectly "flips" I ↔ L (should be penalized less than true errors)
+**Current behavior**:
+- Synthetic data generates random I/L
+- Model must choose I or L (50/50 guess)
+- Loss penalizes "wrong" choice even though it's physically impossible
+- Training loss can never reach zero even on perfect predictions
+
+**Three Options**:
+
+#### **Option A: Collapse to Single Token** (Recommended for MVP)
+```python
+# In constants.py
+AMINO_ACID_MASSES = {
+    ...
+    '[I/L]': 113.08406,  # Single isobaric token
+    # Remove separate 'I' and 'L'
+}
+
+# In synthetic.py:generate_random_peptide()
+def generate_random_peptide(...):
+    # Always use [I/L] token
+    available_aa = [aa for aa in AMINO_ACID_MASSES.keys() ...]
+```
+
+**Pros**:
+- Model never penalized for impossible choice
+- Vocabulary: 23 tokens (cleaner)
+- Evaluation is straightforward
+- Honest about MS limitations
+
+**Cons**:
+- Can't leverage database info if available
+- Less granular than real proteins
+
+**Effort**: 30 minutes (update constants, dataset, metrics)
+
+---
+
+#### **Option B: Multi-label Training with Soft Targets**
+```python
+# When ground truth is 'I', allow both I and L
+if target_aa in ['I', 'L']:
+    soft_targets[pos, AA_TO_IDX['I']] = 0.5
+    soft_targets[pos, AA_TO_IDX['L']] = 0.5
+else:
+    soft_targets[pos, AA_TO_IDX[target_aa]] = 1.0
+
+# Use KL divergence loss instead of cross-entropy
+loss = F.kl_div(log_predictions, soft_targets)
+```
+
+**Pros**:
+- Most principled approach
+- Model learns "these are equivalent"
+- Can still express preference if other evidence exists
+- Generalizes to other isobaric pairs (K/Q: 128.095 vs 128.059)
+
+**Cons**:
+- Requires changing loss function (CE → KL divergence)
+- More complex implementation
+- Slower convergence (model explores both options)
+
+**Effort**: 2 hours (update losses.py, synthetic.py, metrics.py)
+
+---
+
+#### **Option C: Fix Evaluation Metrics Only** (Quick fix)
+```python
+# In metrics.py:token_accuracy()
+def is_isobaric_match(pred_idx, target_idx):
+    """Check if prediction is isobaric equivalent of target."""
+    I_IDX = AA_TO_IDX['I']
+    L_IDX = AA_TO_IDX['L']
+
+    return ((pred_idx == I_IDX) & (target_idx == L_IDX)) | \
+           ((pred_idx == L_IDX) & (target_idx == I_IDX))
+
+def token_accuracy(logits, targets, mask):
+    predictions = logits.argmax(dim=-1)
+    exact_match = (predictions == targets)
+    isobaric_match = is_isobaric_match(predictions, targets)
+
+    correct = (exact_match | isobaric_match) & mask
+    return correct.sum() / mask.sum()
+```
+
+**Pros**:
+- No change to training pipeline
+- 10 minutes to implement
+- Evaluation is fair
+- Can apply retroactively to current run
+
+**Cons**:
+- Training loss still penalizes I/L confusion
+- Model wastes capacity learning impossible distinction
+- Not principled (training/eval mismatch)
+
+**Effort**: 10 minutes (only update metrics.py)
+
+---
+
+**Recommendation**:
+1. **Immediate (current baseline)**: Use **Option C** - fix eval metrics now
+2. **V2 (after baseline works)**: Implement **Option A** - collapse to `[I/L]` token
+3. **Research paper**: Implement **Option B** - multi-label with soft targets
+
+**Also handle K/Q**: Similar issue (128.095 vs 128.059 Da, Δ=0.036). With 20ppm mass error, these become ambiguous too.
+
+**Test**: After implementing, verify that sequences differing only by I↔L swaps have 100% accuracy
 
 ---
 
