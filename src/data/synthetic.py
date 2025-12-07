@@ -102,17 +102,25 @@ def generate_theoretical_spectrum(
     # Calculate residue masses
     residue_masses = [AMINO_ACID_MASSES[aa] for aa in peptide]
 
-    # Precursor mass (full peptide + H2O + charge*proton for m/z)
-    precursor_mass = sum(residue_masses) + WATER_MASS
+    # Precursor mass (full peptide + H2O)
+    precursor_mass_true = sum(residue_masses) + WATER_MASS
+
+    # Apply mass error to precursor (like we do for fragment peaks)
+    if mass_error_ppm > 0:
+        error = precursor_mass_true * random.gauss(0, mass_error_ppm * 1e-6)
+        precursor_mass = precursor_mass_true + error
+    else:
+        precursor_mass = precursor_mass_true
+
     precursor_mz = (precursor_mass + charge * PROTON_MASS) / charge
 
     # Generate b-ions (N-terminal fragments)
-    # b_i = mass of first i residues
+    # b_i = mass of first i residues + H+ (ionized form: [M+H]+)
     if 'b' in ion_types:
         cumulative = 0.0
         for i in range(1, n):  # b1 to b_{n-1}
             cumulative += residue_masses[i - 1]
-            mass = cumulative
+            mass = cumulative + PROTON_MASS  # Add proton for ionization
             intensity = _theoretical_intensity(i, n, 'b')
             peaks.append((mass, intensity))
             annotations[mass] = f'b{i}'
@@ -137,12 +145,12 @@ def generate_theoretical_spectrum(
             annotations[mass] = f'a{i}'
 
     # Generate y-ions (C-terminal fragments)
-    # y_i = mass of last i residues + H2O
+    # y_i = mass of last i residues + H2O + H+ (ionized form: [M+H2O+H]+)
     if 'y' in ion_types:
         cumulative = WATER_MASS  # y-ions include the C-terminal OH
         for i in range(1, n):  # y1 to y_{n-1}
             cumulative += residue_masses[n - i]
-            mass = cumulative
+            mass = cumulative + PROTON_MASS  # Add proton for ionization
             intensity = _theoretical_intensity(i, n, 'y')
             peaks.append((mass, intensity))
             annotations[mass] = f'y{i}'

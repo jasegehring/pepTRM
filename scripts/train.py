@@ -68,20 +68,23 @@ def main():
     # Create trainer
     training_config = TrainingConfig(**cfg.training)
 
-    # Auto-detect CUDA
+    # Auto-detect best available device
     if torch.cuda.is_available():
         training_config.device = 'cuda'
         print(f"\n✓ CUDA available - using GPU")
+    elif torch.backends.mps.is_available():
+        training_config.device = 'mps'
+        print(f"\n✓ MPS available - using Apple Silicon GPU")
     else:
         training_config.device = 'cpu'
-        print(f"\n! CUDA not available - using CPU (training will be slow)")
+        print(f"\n! No GPU available - using CPU (training will be slow)")
 
     trainer = Trainer(
         model=model,
         train_dataset=train_dataset,
         config=training_config,
         val_dataset=val_dataset,
-        use_wandb=False,  # Set to True to enable W&B logging
+        use_wandb=True,  # W&B logging enabled
     )
 
     print(f"\nTraining configuration:")

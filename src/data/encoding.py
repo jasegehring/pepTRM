@@ -28,8 +28,8 @@ class SinusoidalMassEmbedding(nn.Module):
         self,
         dim: int = 256,
         max_mass: float = 2000.0,
-        min_freq: float = 1e-4,
-        max_freq: float = 1.0,
+        min_freq: float = 1.0,      # FIXED: Was 1e-4, now 1.0 (2000 Da coarse features)
+        max_freq: float = 20000.0,  # FIXED: Was 1.0, now 20000.0 (0.1 Da fine resolution)
         learnable_scale: bool = True,
     ):
         """

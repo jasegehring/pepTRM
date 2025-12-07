@@ -147,19 +147,19 @@ class SpectrumMatchingLoss(nn.Module):
         # (batch, seq_len, vocab) @ (vocab,) -> (batch, seq_len)
         expected_masses = torch.einsum('bsv,v->bs', sequence_probs, self.aa_masses)
 
-        # Compute b-ions: cumulative mass from N-terminus
-        # b_i = sum of first i residues
+        # Compute b-ions: cumulative mass from N-terminus + H+ (ionized)
+        # b_i = sum of first i residues + PROTON_MASS
         # Skip position 0 (SOS token) and last position (EOS token)
         residue_masses = expected_masses[:, 1:-1]  # (batch, seq_len - 2)
 
-        # Cumulative sum for b-ions
-        b_ions = torch.cumsum(residue_masses, dim=1)[:, :-1]  # b1 to b_{n-1}
+        # Cumulative sum for b-ions, add proton for ionization
+        b_ions = torch.cumsum(residue_masses, dim=1)[:, :-1] + PROTON_MASS  # b1 to b_{n-1}
 
-        # Compute y-ions: cumulative mass from C-terminus + H2O
+        # Compute y-ions: cumulative mass from C-terminus + H2O + H+ (ionized)
         y_ions = torch.flip(
             torch.cumsum(torch.flip(residue_masses, [1]), dim=1),
             [1]
-        )[:, :-1] + WATER_MASS
+        )[:, :-1] + WATER_MASS + PROTON_MASS
 
         # Concatenate all theoretical peaks
         theoretical_peaks = torch.cat([b_ions, y_ions], dim=1)

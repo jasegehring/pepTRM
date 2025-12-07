@@ -39,7 +39,7 @@ training:
   learning_rate: 1.0e-4
   weight_decay: 0.01
   batch_size: 64
-  max_steps: 50000
+  max_steps: 10000  # Short run for validation (50000 for full training)
   warmup_steps: 1000
 
   # Loss weights
@@ -64,4 +64,4 @@ training:
   checkpoint_dir: 'checkpoints'
 
   # Device
-  device: 'cpu'  # Will auto-detect CUDA
+  device: 'mps'  # MPS for Apple Silicon (M1/M2/M3), or 'cpu'

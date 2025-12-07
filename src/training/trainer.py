@@ -137,13 +137,13 @@ class Trainer:
                 spectrum_weight=config.spectrum_weight,
                 iteration_weights=config.iteration_weights,
                 label_smoothing=config.label_smoothing,
-            )
+            ).to(self.device)
             self.use_combined_loss = True
         else:
             self.loss_fn = DeepSupervisionLoss(
                 iteration_weights=config.iteration_weights,
                 label_smoothing=config.label_smoothing,
-            )
+            ).to(self.device)
             self.use_combined_loss = False
 
         # Curriculum scheduler
@@ -218,6 +218,20 @@ class Trainer:
                 targets=batch['sequence'],
                 target_mask=batch['sequence_mask'],
             )
+
+        # Compute flip rates (before backward pass, with torch.no_grad)
+        with torch.no_grad():
+            num_steps = all_logits.shape[0]
+            target_mask = batch['sequence_mask']
+
+            for t in range(1, num_steps):
+                prev_preds = all_logits[t-1].argmax(dim=-1)  # (batch, seq_len)
+                curr_preds = all_logits[t].argmax(dim=-1)
+
+                # Count flips (only on valid positions)
+                flips = (prev_preds != curr_preds) & target_mask
+                flip_rate = flips.float().sum() / target_mask.sum().clamp(min=1)
+                metrics[f'flip_rate_{t-1}_to_{t}'] = flip_rate.item()
 
         # Backward pass
         self.optimizer.zero_grad()

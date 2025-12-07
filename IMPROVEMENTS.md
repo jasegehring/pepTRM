@@ -6,8 +6,54 @@ This file tracks ideas and enhancements to implement after the baseline training
 
 ## High Priority 🔴
 
+### 0. Fix Mass Embedding Resolution (CRITICAL - Model is Blind!)
+**Status**: ✅ **IMPLEMENTED** (Dec 7, 2025)
+**Priority**: **CRITICAL** - Must fix before any other changes!
+**Effort**: 2 minutes
+
+**Problem**: Current mass embedding **cannot distinguish 1 Da differences**. The model literally sees I (113.08 Da) and N (114.04 Da) as identical!
+
+**Physics**:
+- To distinguish Δm = 1 Da, need wavelength λ < 2 Da (Nyquist criterion)
+- Current: `max_freq = 1.0` → min wavelength = 2000 Da ❌
+- Required: `max_freq = 1000.0` → min wavelength = 2.0 Da ✓
+
+**Test Results** (current broken implementation):
+```
+I (113.08 Da) vs N (114.04 Da):
+  Δ mass: 0.96 Da
+  L2 distance: 0.0082  ← Too small!
+  Cosine similarity: 1.000000  ← Identical!
+```
+
+**Current Code** (`src/data/encoding.py` line 32):
+```python
+max_freq: float = 1.0,  # WRONG - too low!
+```
+
+**Proposed Fix**:
+```python
+max_freq: float = 1000.0,  # Allows 1 Da resolution
+```
+
+**Impact**:
+- **Currently**: Model cannot use mass information AT ALL
+- **After fix**: Model can distinguish amino acids by mass
+- This is why token accuracy is only 48% (barely better than random!)
+- This must be fixed before enabling spectrum matching loss
+
+**Validation**:
+After fix, verify that:
+```python
+embedding(113.08) vs embedding(114.04)
+→ L2 distance > 0.5
+→ Cosine similarity < 0.99
+```
+
+---
+
 ### 1. Add Protonation to Fragment Ions (Critical Physics Bug!)
-**Status**: Not implemented
+**Status**: ✅ **IMPLEMENTED** (Dec 7, 2025)
 **Priority**: **CRITICAL**
 **Effort**: 5 minutes
 
@@ -54,7 +100,7 @@ y_ions = torch.flip(...) + WATER_MASS + PROTON_MASS
 ---
 
 ### 2. Add Precursor Noise to Synthetic Data
-**Status**: Not implemented
+**Status**: ✅ **IMPLEMENTED** (Dec 7, 2025)
 **Priority**: High
 **Effort**: 5 minutes
 
@@ -92,7 +138,62 @@ precursor_mz = (precursor_mass + charge * PROTON_MASS) / charge
 
 ## Medium Priority 🟡
 
-### 2. Add Precursor Mass Loss (Global Constraint)
+### 2. Add "Flip Rate" Metric (Recursive Refinement Monitor)
+**Status**: ✅ **IMPLEMENTED** (Dec 7, 2025)
+**Priority**: Medium
+**Effort**: 10 minutes
+
+**Problem**: We have no direct metric for **how much** the recursive refinement is changing predictions. Currently we only track loss per step, but don't measure token-level changes.
+
+**What is Flip Rate?**
+Count how many tokens **change** between iteration $t$ and iteration $t+1$:
+
+```python
+flip_rate_t = (argmax(logits_t) != argmax(logits_{t+1})).float().mean()
+```
+
+**Why it matters**:
+- Direct measure of whether recursive loop is doing something
+- If flip_rate → 0 early, model converged (or stuck)
+- If flip_rate stays high, model is unstable/oscillating
+- Complements loss metrics with interpretable token-level changes
+
+**Location**: `src/training/trainer.py:train_step()`
+
+**Proposed Implementation**:
+```python
+# In trainer.py, after forward pass
+all_logits, _ = self.model(...)  # (T, batch, seq_len, vocab)
+
+# Compute flip rates between consecutive steps
+flip_rates = {}
+for t in range(1, num_steps):
+    prev_preds = all_logits[t-1].argmax(dim=-1)  # (batch, seq_len)
+    curr_preds = all_logits[t].argmax(dim=-1)
+
+    # Count flips (only on valid positions)
+    flips = (prev_preds != curr_preds) & target_mask
+    flip_rates[f'flip_rate_{t-1}_to_{t}'] = flips.float().sum() / target_mask.sum()
+
+# Log to W&B
+metrics.update(flip_rates)
+```
+
+**Expected Behavior**:
+- **Healthy**: Flip rate high early (20-40%), decreases to ~5% by final step
+  - Shows model is refining, then converging
+- **Bad (stuck)**: Flip rate ~0% at all steps
+  - Model not using recursive loop
+- **Bad (oscillating)**: Flip rate stays >30% even at final steps
+  - Model unstable, needs lower learning rate or better initialization
+
+**Visualization Ideas**:
+- Plot flip_rate vs step (should show decreasing trend)
+- Track flip_rate over training (should increase as model learns to refine)
+
+---
+
+### 3. Add Precursor Mass Loss (Global Constraint)
 **Status**: Partially implemented (fragment matching exists, but no direct precursor loss)
 **Priority**: Medium
 **Effort**: 15 minutes
