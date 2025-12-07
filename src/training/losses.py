@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..constants import AMINO_ACID_MASSES, WATER_MASS, VOCAB, PAD_IDX
+from ..constants import AMINO_ACID_MASSES, WATER_MASS, PROTON_MASS, VOCAB, PAD_IDX
 
 
 class DeepSupervisionLoss(nn.Module):
