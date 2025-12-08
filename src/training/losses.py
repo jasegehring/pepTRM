@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..constants import AMINO_ACID_MASSES, WATER_MASS, PROTON_MASS, VOCAB, PAD_IDX
+from ..constants import AMINO_ACID_MASSES, WATER_MASS, PROTON_MASS, VOCAB, PAD_IDX, CO_MASS
 
 
 class DeepSupervisionLoss(nn.Module):
@@ -201,6 +201,9 @@ class SpectrumMatchingLoss(nn.Module):
 
         # Soft assignment weights
         soft_assignment = F.softmax(scores, dim=-1)
+
+        # Replace NaNs with 0 for cases where a theoretical peak has no valid matches
+        soft_assignment = torch.nan_to_num(soft_assignment, nan=0.0)
 
         # Expected distance for each theoretical peak (weighted by soft assignment)
         # We clamp the distances to the tolerance to avoid penalizing matches outside the window
