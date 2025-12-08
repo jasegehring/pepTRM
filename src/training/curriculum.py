@@ -31,12 +31,14 @@ class CurriculumStage:
     spectrum_loss_weight: float = 0.0
 
 
-# Simplified 3-stage curriculum for MVP
+# 6-stage curriculum to prevent catastrophic forgetting
+# Based on analysis of 50K training run showing 93%→49% cliff at step 21K
+# Key insight: Gradual noise introduction (0→1→2→5→8 peaks) instead of 0→5 jump
 DEFAULT_CURRICULUM = [
-    # Stage 1: Easy - short peptides, clean spectra
+    # Stage 1 (0-8K): Pure CE on clean data - learn basic sequence patterns
     CurriculumStage(
-        name="clean",
-        steps=10000,
+        name="stage_1_warmup",
+        steps=8000,
         min_length=7,
         max_length=10,
         noise_peaks=0,
@@ -45,29 +47,69 @@ DEFAULT_CURRICULUM = [
         spectrum_loss_weight=0.0,  # Pure CE first
     ),
 
-    # Stage 2: Moderate difficulty
+    # Stage 2 (8K-16K): Add spectrum loss, KEEP data clean
+    # Previous run proved this works: 93% token acc, 6.7K ppm mass error achieved
     CurriculumStage(
-        name="moderate",
-        steps=15000,
+        name="stage_2_spectrum_loss",
+        steps=8000,  # 8K-16K
         min_length=7,
-        max_length=15,
-        noise_peaks=5,
-        peak_dropout=0.1,
+        max_length=10,  # Same as Stage 1
+        noise_peaks=0,   # Keep clean!
+        peak_dropout=0.0,
         mass_error_ppm=0.0,
+        spectrum_loss_weight=0.1,  # NEW: Learn mass constraints
+    ),
+
+    # Stage 2.5 (16K-22K): CRITICAL - First exposure to imperfection
+    # Gentle introduction with just 1 noise peak to avoid distribution cliff
+    CurriculumStage(
+        name="stage_2.5_gentle_noise",
+        steps=6000,  # 16K-22K
+        min_length=7,
+        max_length=12,  # Slightly longer peptides
+        noise_peaks=1,   # Start with 1 noise peak only
+        peak_dropout=0.02,  # Minimal dropout
+        mass_error_ppm=2.0,  # Small mass error
         spectrum_loss_weight=0.1,
     ),
 
-    # Stage 3: Realistic synthetic
+    # Stage 2.75 (22K-28K): Gradual noise increase
+    # Bridge to moderate difficulty
     CurriculumStage(
-        name="realistic",
-        steps=25000,
+        name="stage_2.75_gradual_noise",
+        steps=6000,  # 22K-28K
         min_length=7,
-        max_length=20,
-        noise_peaks=10,
-        peak_dropout=0.2,
-        mass_error_ppm=20.0,
+        max_length=12,
+        noise_peaks=2,   # Increase to 2 noise peaks
+        peak_dropout=0.05,
+        mass_error_ppm=5.0,
+        spectrum_loss_weight=0.12,  # Slightly increase
+    ),
+
+    # Stage 3 (28K-38K): Moderate difficulty
+    # Now safe to introduce 5 noise peaks after gradual ramp
+    CurriculumStage(
+        name="stage_3_moderate",
+        steps=10000,  # 28K-38K
+        min_length=7,
+        max_length=15,
+        noise_peaks=5,   # Was causing cliff before - now gradual
+        peak_dropout=0.10,
+        mass_error_ppm=10.0,
+        spectrum_loss_weight=0.15,
+    ),
+
+    # Stage 4 (38K-50K): Realistic conditions
+    CurriculumStage(
+        name="stage_4_realistic",
+        steps=12000,  # 38K-50K
+        min_length=7,
+        max_length=18,  # Longer peptides
+        noise_peaks=8,   # More realistic noise level
+        peak_dropout=0.15,
+        mass_error_ppm=15.0,
         intensity_variation=0.2,
-        spectrum_loss_weight=0.1,
+        spectrum_loss_weight=0.15,
     ),
 ]
 
