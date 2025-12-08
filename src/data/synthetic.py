@@ -39,25 +39,20 @@ def _theoretical_intensity(ion_index: int, peptide_length: int, ion_type: str) -
     """
     Generate theoretical intensity for a fragment ion.
 
-    In real spectra, intensity depends on many factors. For synthetic data,
-    we use a simple model where middle fragments are more intense.
+    In real spectra, intensity is highly variable. We use a stochastic
+    model based on a beta distribution to mimic this and remove any
+    simple deterministic patterns from the data.
     """
-    # Normalized position (0 to 1)
-    if ion_type in ['b', 'a']:
-        pos = ion_index / peptide_length
-    else:  # y-ions
-        pos = ion_index / peptide_length
-
-    # Bell curve - middle fragments slightly more intense
-    base_intensity = 0.5 + 0.5 * (1 - abs(pos - 0.5) * 2)
-
-    # y-ions typically more intense than b-ions
+    # Heuristic: y-ions are often more prominent and have a wider intensity range.
+    # b- and a-ions are often less intense.
     if ion_type == 'y':
-        base_intensity *= 1.2
-    elif ion_type == 'a':
-        base_intensity *= 0.5
+        # Beta distribution centered around ~0.5, creating a wide range of intensities
+        intensity = random.betavariate(2, 2)
+    else:  # b- and a-ions
+        # Beta distribution skewed towards lower values
+        intensity = random.betavariate(2, 5)
 
-    return min(1.0, base_intensity)
+    return max(0.01, intensity)  # Ensure a minimum intensity
 
 
 def generate_theoretical_spectrum(
@@ -139,8 +134,8 @@ def generate_theoretical_spectrum(
         cumulative = 0.0
         for i in range(1, n):
             cumulative += residue_masses[i - 1]
-            mass = cumulative - CO_MASS
-            intensity = _theoretical_intensity(i, n, 'a') * 0.5  # a-ions typically weaker
+            mass = cumulative - CO_MASS + PROTON_MASS  # Add proton for ionization
+            intensity = _theoretical_intensity(i, n, 'a')
             peaks.append((mass, intensity))
             annotations[mass] = f'a{i}'
 

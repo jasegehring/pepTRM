@@ -14,6 +14,7 @@ class TestTheoreticalSpectrum:
 
     def test_b_ion_series(self):
         """Verify b-ion masses."""
+        from src.constants import PROTON_MASS
         spectrum = generate_theoretical_spectrum("AG", ion_types=['b'])
 
         # b1 = A = 71.04
@@ -23,11 +24,13 @@ class TestTheoreticalSpectrum:
         ) if 'b' in a]
 
         assert len(b_ions) >= 1
-        # b1 should be mass of A
-        assert abs(b_ions[0][0] - AMINO_ACID_MASSES['A']) < 0.01
+        # b1 should be mass of A + H+
+        expected_b1_mz = AMINO_ACID_MASSES['A'] + PROTON_MASS
+        assert abs(b_ions[0][0] - expected_b1_mz) < 0.01
 
     def test_y_ion_series(self):
         """Verify y-ion masses (include water)."""
+        from src.constants import PROTON_MASS
         spectrum = generate_theoretical_spectrum("AG", ion_types=['y'])
 
         y_ions = [(m, a) for m, a in zip(
@@ -36,9 +39,9 @@ class TestTheoreticalSpectrum:
         ) if 'y' in a]
 
         assert len(y_ions) >= 1
-        # y1 = G + H2O
-        expected_y1 = AMINO_ACID_MASSES['G'] + WATER_MASS
-        assert abs(y_ions[0][0] - expected_y1) < 0.01
+        # y1 = G + H2O + H+
+        expected_y1_mz = AMINO_ACID_MASSES['G'] + WATER_MASS + PROTON_MASS
+        assert abs(y_ions[0][0] - expected_y1_mz) < 0.01
 
     def test_precursor_mass(self):
         """Verify precursor mass calculation."""

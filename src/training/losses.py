@@ -139,16 +139,12 @@ class SpectrumMatchingLoss(nn.Module):
         E[mass_i] = sum_aa P(aa_i) * mass(aa)
 
         Returns:
-            (batch, num_theoretical_peaks) expected masses for b and y ions
+            (batch, num_theoretical_peaks) expected masses for b, y, and a ions
         """
-        batch_size, seq_len, vocab_size = sequence_probs.shape
-
         # Expected mass at each position
         # (batch, seq_len, vocab) @ (vocab,) -> (batch, seq_len)
         expected_masses = torch.einsum('bsv,v->bs', sequence_probs, self.aa_masses)
 
-        # Compute b-ions: cumulative mass from N-terminus + H+ (ionized)
-        # b_i = sum of first i residues + PROTON_MASS
         # Skip position 0 (SOS token) and last position (EOS token)
         residue_masses = expected_masses[:, 1:-1]  # (batch, seq_len - 2)
 
@@ -161,8 +157,11 @@ class SpectrumMatchingLoss(nn.Module):
             [1]
         )[:, :-1] + WATER_MASS + PROTON_MASS
 
+        # Compute a-ions: b-ions minus CO
+        a_ions = b_ions - CO_MASS
+
         # Concatenate all theoretical peaks
-        theoretical_peaks = torch.cat([b_ions, y_ions], dim=1)
+        theoretical_peaks = torch.cat([b_ions, y_ions, a_ions], dim=1)
 
         return theoretical_peaks
 
@@ -185,31 +184,37 @@ class SpectrumMatchingLoss(nn.Module):
         # Compute pairwise distances between theoretical and observed peaks
         # theoretical: (batch, num_theo, 1)
         # observed: (batch, 1, max_peaks)
-        theo_expanded = theoretical.unsqueeze(-1)  # (batch, num_theo, 1)
-        obs_expanded = observed_masses.unsqueeze(1)  # (batch, 1, max_peaks)
+        theo_expanded = theoretical.unsqueeze(-1)
+        obs_expanded = observed_masses.unsqueeze(1)
 
         # Absolute distance: (batch, num_theo, max_peaks)
         distances = torch.abs(theo_expanded - obs_expanded)
 
         # Soft assignment: which observed peak matches each theoretical peak?
-        # Use softmin over distances
+        # Use softmin over distances, restricted to a tolerance window.
         scores = -distances / self.temperature
 
-        # Mask out padding peaks
-        mask_expanded = peak_mask.unsqueeze(1).float()  # (batch, 1, max_peaks)
-        scores = scores.masked_fill(~peak_mask.unsqueeze(1), float('-inf'))
+        # Create a combined mask: must be a real peak (not padding) AND within mass tolerance.
+        in_window_mask = (distances < self.mass_tolerance)
+        combined_mask = peak_mask.unsqueeze(1) & in_window_mask
+        scores = scores.masked_fill(~combined_mask, float('-inf'))
 
         # Soft assignment weights
-        soft_assignment = F.softmax(scores, dim=-1)  # (batch, num_theo, max_peaks)
+        soft_assignment = F.softmax(scores, dim=-1)
 
         # Expected distance for each theoretical peak (weighted by soft assignment)
-        matched_distances = (soft_assignment * distances).sum(dim=-1)  # (batch, num_theo)
+        # We clamp the distances to the tolerance to avoid penalizing matches outside the window
+        # that might get a tiny softmax weight due to temperature.
+        clamped_distances = torch.clamp(distances, max=self.mass_tolerance)
+        matched_distances = (soft_assignment * clamped_distances).sum(dim=-1)
 
         # Weight by intensity of matched peaks
         intensity_weights = (soft_assignment * observed_intensities.unsqueeze(1)).sum(dim=-1)
 
         # Average over theoretical peaks
-        loss = (matched_distances * intensity_weights).mean()
+        # We only want to average over theoretical peaks that had at least one match in the window
+        num_matches = combined_mask.any(dim=-1).float()
+        loss = (matched_distances * intensity_weights * num_matches).sum() / num_matches.sum().clamp(min=1)
 
         return loss
 
