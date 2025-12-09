@@ -117,10 +117,14 @@ class SpectrumMatchingLoss(nn.Module):
         self,
         mass_tolerance: float = 0.5,   # Da, for matching window
         temperature: float = 0.1,       # For soft assignment
+        use_huber: bool = True,         # Use Huber loss instead of L1
+        huber_delta: float = 0.2,       # Da, threshold for Huber loss
     ):
         super().__init__()
         self.mass_tolerance = mass_tolerance
         self.temperature = temperature
+        self.use_huber = use_huber
+        self.huber_delta = huber_delta
 
         # Register amino acid masses as buffer
         aa_masses = torch.tensor([
@@ -209,7 +213,20 @@ class SpectrumMatchingLoss(nn.Module):
         # We clamp the distances to the tolerance to avoid penalizing matches outside the window
         # that might get a tiny softmax weight due to temperature.
         clamped_distances = torch.clamp(distances, max=self.mass_tolerance)
-        matched_distances = (soft_assignment * clamped_distances).sum(dim=-1)
+
+        # Apply Huber loss if enabled (more robust to outliers)
+        if self.use_huber:
+            # Huber loss: quadratic for small errors (|error| <= delta), linear for large errors
+            # This is less sensitive to outlier peaks than pure L1 or L2
+            huber_loss = torch.where(
+                clamped_distances <= self.huber_delta,
+                0.5 * clamped_distances ** 2,  # Quadratic for small errors
+                self.huber_delta * (clamped_distances - 0.5 * self.huber_delta)  # Linear for large errors
+            )
+            matched_distances = (soft_assignment * huber_loss).sum(dim=-1)
+        else:
+            # Standard L1 loss (absolute distance)
+            matched_distances = (soft_assignment * clamped_distances).sum(dim=-1)
 
         # Weight by intensity of matched peaks
         intensity_weights = (soft_assignment * observed_intensities.unsqueeze(1)).sum(dim=-1)
@@ -234,6 +251,8 @@ class CombinedLoss(nn.Module):
         iteration_weights: str = 'linear',
         label_smoothing: float = 0.0,
         mass_tolerance: float = 0.5,
+        use_huber: bool = True,
+        huber_delta: float = 0.2,
     ):
         super().__init__()
         self.ce_weight = ce_weight
@@ -246,6 +265,8 @@ class CombinedLoss(nn.Module):
 
         self.spectrum_loss = SpectrumMatchingLoss(
             mass_tolerance=mass_tolerance,
+            use_huber=use_huber,
+            huber_delta=huber_delta,
         )
 
     def forward(

@@ -1,0 +1,70 @@
+# Optimized configuration for RTX 4090 with extended, smoother curriculum
+# Expected training time: ~2.5 hours for 100K steps (vs ~7 hours without optimizations)
+
+model:
+  hidden_dim: 256
+  num_encoder_layers: 2
+  num_decoder_layers: 2
+  num_heads: 4
+  max_peaks: 100
+  max_seq_len: 25
+  num_supervision_steps: 8
+  num_latent_steps: 4
+  dropout: 0.1
+
+training:
+  # Optimization (3x faster!)
+  learning_rate: 1.5e-4  # Slightly higher for larger batch
+  weight_decay: 0.01
+  batch_size: 192  # 3x larger than baseline (optimized for RTX 4090)
+  max_steps: 100000  # 2x longer training
+  warmup_steps: 2000  # Proportional increase
+
+  # Mixed Precision (NEW - 2-3x speedup)
+  use_amp: true
+  amp_dtype: 'float16'  # Use 'bfloat16' if available
+
+  # Gradient Accumulation (if batch too large)
+  gradient_accumulation_steps: 1
+
+  # Model Compilation (NEW - 1.2-1.5x speedup)
+  use_compile: true
+  compile_mode: 'max-autotune'
+
+  # Loss configuration
+  ce_weight: 1.0
+  spectrum_weight: 0.0  # Controlled by curriculum
+  iteration_weights: 'linear'
+  label_smoothing: 0.1  # Increased for robustness
+
+  # Curriculum (smoother, extended)
+  use_curriculum: true
+
+  # EMA (critical for stability)
+  use_ema: true
+  ema_decay: 0.999
+
+  # Logging (more frequent for longer training)
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 5000
+
+  # Paths
+  checkpoint_dir: 'checkpoints_optimized'
+
+  # Device (auto-detected)
+  device: 'cuda'
+
+data:
+  # Initial curriculum stage (will be updated automatically)
+  min_length: 7
+  max_length: 10
+  ion_types: ['b', 'y']
+  include_neutral_losses: false
+  noise_peaks: 0
+  peak_dropout: 0.0
+  mass_error_ppm: 0.0
+  intensity_variation: 0.0
+  charge_distribution:
+    2: 0.7
+    3: 0.3

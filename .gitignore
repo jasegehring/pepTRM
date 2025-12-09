@@ -35,10 +35,13 @@ env/
 # Project specific
 /data/
 checkpoints/
+checkpoints_optimized/
 wandb/
 *.pt
 *.pth
 *.ckpt
+*.log
+nohup.out
 
 # Jupyter
 .ipynb_checkpoints/
