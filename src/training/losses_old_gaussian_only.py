@@ -1,13 +1,6 @@
 """
-Loss functions for peptide sequencing.
-
-Combines the best approaches:
-1. Gaussian Spectrum Rendering - low variance, bounded loss, smooth gradients
-2. Log-scaled Precursor Loss - robust gradients, interpretable ppm metrics
-3. Deep Supervision - trajectory-based learning across all refinement steps
-
-This implementation merges improvements from previous experiments to create
-optimal training signals with low variance and strong convergence properties.
+Loss functions for peptide sequencing (TRM).
+Includes Deep Supervision, Differentiable Spectrum Matching, and Precursor constraints.
 """
 
 import torch
@@ -16,6 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import List, Optional, Tuple, Dict
 
+# Assuming these exist in your project structure
 from ..constants import AMINO_ACID_MASSES, WATER_MASS, VOCAB, PAD_IDX
 from ..data.ion_types import compute_theoretical_peaks, get_ion_types_for_model, validate_ion_types
 
@@ -23,7 +17,7 @@ from ..data.ion_types import compute_theoretical_peaks, get_ion_types_for_model,
 class DeepSupervisionLoss(nn.Module):
     """
     Cross-entropy loss summed over all supervision steps.
-
+    
     Forces the model to learn a trajectory of improvement by supervising
     every intermediate recursive step.
     """
@@ -33,14 +27,6 @@ class DeepSupervisionLoss(nn.Module):
         iteration_weights: str = 'linear',
         label_smoothing: float = 0.0,
     ):
-        """
-        Args:
-            iteration_weights: How to weight different steps
-                - 'uniform': All steps weighted equally
-                - 'linear': Later steps weighted more (1, 2, 3, ...)
-                - 'exponential': Exponential weighting toward later steps
-            label_smoothing: Label smoothing for cross-entropy
-        """
         super().__init__()
         self.iteration_weights = iteration_weights
         self.label_smoothing = label_smoothing
@@ -64,16 +50,10 @@ class DeepSupervisionLoss(nn.Module):
         targets: Tensor,         # (batch, seq_len)
         target_mask: Tensor,     # (batch, seq_len)
     ) -> Tuple[Tensor, Dict[str, float]]:
-        """
-        Compute deep supervision loss.
-
-        Returns:
-            loss: Scalar loss value
-            metrics: Dict with per-step losses for logging
-        """
+        
         num_steps = all_logits.shape[0]
         weights = self._get_weights(num_steps, all_logits.device)
-
+        
         total_loss = 0.0
         step_losses = []
 
@@ -94,7 +74,7 @@ class DeepSupervisionLoss(nn.Module):
             )
 
             masked_loss = (ce_loss * mask_flat).sum() / mask_sum
-
+            
             step_losses.append(masked_loss.item())
             total_loss = total_loss + weights[t] * masked_loss
 
@@ -108,15 +88,9 @@ class SpectrumMatchingLoss(nn.Module):
     """
     Differentiable Spectrum Matching using Gaussian Kernel Density Estimation.
 
-    Instead of matching peaks by hard distance (which has poor gradients and high variance),
-    we 'render' the predicted masses into a spectral bin vector using Gaussian kernels
-    and compare it to the observed spectrum using Cosine Similarity.
-
-    Benefits over min-distance matching:
-    - Bounded loss [0, 2] (vs unbounded min-distance)
-    - Low variance (normalized spectra)
-    - Smooth gradients (Gaussian kernels vs hard min operations)
-    - Scale-invariant (cosine similarity focuses on spectral shape)
+    Instead of matching peaks by hard distance (which has poor gradients),
+    we 'render' the predicted masses into a spectral bin vector using 
+    Gaussian kernels and compare it to the observed spectrum using Cosine Similarity.
     """
 
     def __init__(
@@ -127,23 +101,15 @@ class SpectrumMatchingLoss(nn.Module):
         ion_type_names: Optional[List[str]] = None,
         ms2pip_model: Optional[str] = None,
     ):
-        """
-        Args:
-            bin_size: Resolution of spectral grid in Daltons (0.1 Da = good for MS/MS)
-            max_mz: Maximum m/z value to consider
-            sigma: Gaussian kernel width (typically bin_size/2 for sharp peaks)
-            ion_type_names: List of ion types (e.g., ['b', 'y', 'b++', 'y++'])
-            ms2pip_model: MS2PIP model name (e.g., 'HCDch2') to auto-select ion types
-        """
         super().__init__()
         self.bin_size = bin_size
         self.max_mz = max_mz
         self.sigma = sigma
-
+        
         # Create grid buffer
         num_bins = int(max_mz / bin_size)
         self.register_buffer('mz_grid', torch.linspace(0, max_mz, num_bins).view(1, 1, -1))
-
+        
         # Setup Ion Types
         if ion_type_names is not None:
             validate_ion_types(ion_type_names)
@@ -152,7 +118,7 @@ class SpectrumMatchingLoss(nn.Module):
             self.ion_type_names = get_ion_types_for_model(ms2pip_model)
         else:
             self.ion_type_names = ['b', 'y']
-            print(f"⚠️  SpectrumMatchingLoss: No ion types specified, defaulting to {self.ion_type_names}")
+            print(f"⚠️ SpectrumMatchingLoss: Defaulting to {self.ion_type_names}")
 
         # AA masses buffer
         aa_masses = torch.tensor([AMINO_ACID_MASSES.get(aa, 0.0) for aa in VOCAB])
@@ -161,7 +127,6 @@ class SpectrumMatchingLoss(nn.Module):
     def _gaussian_render(self, masses: Tensor, intensities: Optional[Tensor] = None) -> Tensor:
         """
         Render masses into a spectrum using Gaussian kernels.
-
         Args:
             masses: (batch, num_peaks)
             intensities: (batch, num_peaks) or None (assumes 1.0)
@@ -169,18 +134,23 @@ class SpectrumMatchingLoss(nn.Module):
             spectrum: (batch, num_bins)
         """
         # Expand dims for broadcasting: (batch, peaks, 1) - (1, 1, bins)
+        # Note: This creates a large tensor. 
+        # For max_mz=2000, bin=0.1 -> 20k bins. 
+        # Batch 64 * 100 peaks * 20k bins * 4 bytes ~= 500MB memory. 
+        # This is safe for modern GPUs.
         diff = masses.unsqueeze(-1) - self.mz_grid
-
-        # Compute Gaussian activations: exp(-0.5 * (x - mu)^2 / sigma^2)
+        
+        # Compute Gaussian activations
+        # exp(-0.5 * (x - mu)^2 / sigma^2)
         activations = torch.exp(-0.5 * (diff / self.sigma) ** 2)
-
+        
         # Apply intensities if provided
         if intensities is not None:
             activations = activations * intensities.unsqueeze(-1)
-
+            
         # Sum over peaks to get total spectrum
         spectrum = activations.sum(dim=1)
-
+        
         return spectrum
 
     def forward(
@@ -190,78 +160,70 @@ class SpectrumMatchingLoss(nn.Module):
         observed_intensities: Tensor, # (batch, max_peaks)
         peak_mask: Tensor,            # (batch, max_peaks)
     ) -> Tensor:
-        """
-        Compute spectrum matching loss via Gaussian rendering.
-
-        Returns:
-            loss: Scalar in range [0, 2], where 0 = perfect match
-        """
+        
         # 1. Compute Predicted Theoretical Peaks (Differentiable)
+        # Expectation: E[mass] = sum(P(aa) * mass(aa))
+        # This function must return (batch, num_theo_peaks)
         predicted_masses = compute_theoretical_peaks(
             sequence_probs=sequence_probs,
             aa_masses=self.aa_masses,
             ion_type_names=self.ion_type_names,
         )
-
-        # 2. Render Predicted Spectrum (uniform intensity)
+        
+        # 2. Render Predicted Spectrum
+        # We assume uniform intensity (1.0) for theoretical peaks for now, 
+        # as we are only predicting sequence, not intensity.
+        # Ideally, this would use predicted intensities if your model outputs them.
         pred_spectrum = self._gaussian_render(predicted_masses)
-
+        
         # 3. Render Observed Spectrum
+        # We render the observed peaks onto the same grid to handle noise/alignment
         with torch.no_grad():
             # Mask out padding in observed data
             obs_masses_masked = observed_masses * peak_mask.float()
             obs_intens_masked = observed_intensities * peak_mask.float()
-
+            
             target_spectrum = self._gaussian_render(obs_masses_masked, obs_intens_masked)
-
+            
             # Normalize target spectrum to max 1.0 for stability
             target_max = target_spectrum.max(dim=1, keepdim=True)[0].clamp(min=1e-8)
             target_spectrum = target_spectrum / target_max
 
-        # 4. Normalize Predicted Spectrum (ensures loss depends on shape, not magnitude)
+        # 4. Normalize Predicted Spectrum
+        # This ensures the loss depends on shape (correlation), not magnitude
         pred_max = pred_spectrum.max(dim=1, keepdim=True)[0].clamp(min=1e-8)
         pred_spectrum = pred_spectrum / pred_max
 
         # 5. Compute Cosine Similarity Loss
-        # 1.0 - CosineSimilarity. Perfect match = 0.0 loss, orthogonal = 2.0 loss
+        # 1.0 - CosineSimilarity. Perfect match = 0.0 loss.
+        # We use cosine because it focuses on the *alignment* of peaks, not absolute values.
         similarity = F.cosine_similarity(pred_spectrum, target_spectrum, dim=1)
         loss = 1.0 - similarity.mean()
-
+        
         return loss
 
 
 class PrecursorMassLoss(nn.Module):
     """
-    Precursor mass constraint with log-scaling for robust gradients.
-
-    Penalizes predictions whose total mass doesn't match the given precursor mass.
-    Uses log-scaling to provide:
-    - Bounded growth for large errors (prevents explosion)
-    - Strong gradients for small errors
-    - Non-zero gradients even for very large errors
-    - Interpretable ppm metrics
+    Penalizes predictions where total peptide mass != precursor mass.
+    Uses scaled L1 loss for stability.
     """
 
-    def __init__(
-        self,
-        use_relative: bool = True,     # Use relative error (ppm) instead of absolute (Da)
-        loss_scale: float = 100000.0,  # Scale parameter for log loss (100k ppm = 10% error)
-        use_log_loss: bool = True,     # Use log(1 + error/scale) for bounded gradients
-    ):
+    def __init__(self, scale_factor: float = 0.004):
         """
         Args:
-            use_relative: Use ppm errors (True) or absolute Da errors (False)
-            loss_scale: Scaling for log loss. With 100k ppm:
-                - 100k ppm (10% error) → log(2) ≈ 0.69
-                - 10k ppm (1% error) → log(1.1) ≈ 0.095
-                - 1k ppm (0.1% error) → log(1.01) ≈ 0.01
-            use_log_loss: Use log scaling (True) or clamping (False, legacy)
+            scale_factor: Scaling factor for L1 loss.
+                          0.004 means 250 Da error = 1.0 loss.
+                          Tuned to provide strong gradients without dominating CE loss.
+
+                          Expected contributions (with curriculum weight 0.01):
+                          - 200 Da error: 0.008 to total loss
+                          - 100 Da error: 0.004 to total loss
+                          - 50 Da error: 0.002 to total loss
         """
         super().__init__()
-        self.use_relative = use_relative
-        self.loss_scale = loss_scale
-        self.use_log_loss = use_log_loss
-
+        self.scale_factor = scale_factor
+        
         aa_masses = torch.tensor([AMINO_ACID_MASSES.get(aa, 0.0) for aa in VOCAB])
         self.register_buffer('aa_masses', aa_masses)
 
@@ -271,44 +233,24 @@ class PrecursorMassLoss(nn.Module):
         precursor_mass: Tensor,    # (batch,)
         sequence_mask: Tensor,     # (batch, seq_len)
     ) -> Tuple[Tensor, Dict[str, float]]:
-        """
-        Compute precursor mass constraint loss.
-
-        Returns:
-            loss: Scalar loss value
-            metrics: Dict with mass_error_da, ppm_error, predicted_peptide_mass
-        """
-        # Calculate expected mass per position: E[mass_i] = sum_aa P(aa_i) * mass(aa)
+        
+        # Calculate expected mass per position
+        # (batch, seq_len, vocab) @ (vocab,) -> (batch, seq_len)
         expected_masses = torch.einsum('bsv,v->bs', sequence_probs, self.aa_masses)
 
         # Sum valid positions
         predicted_peptide_mass = (expected_masses * sequence_mask.float()).sum(dim=1)
-        predicted_precursor_mass = predicted_peptide_mass + WATER_MASS
+        predicted_total = predicted_peptide_mass + WATER_MASS
 
         # Absolute Error
-        mass_error = torch.abs(predicted_precursor_mass - precursor_mass)
-
-        if self.use_relative:
-            # Convert to ppm (parts per million)
-            ppm_error = (mass_error / precursor_mass.clamp(min=1.0)) * 1e6
-
-            if self.use_log_loss:
-                # Log scaling for bounded gradients
-                loss = torch.log1p(ppm_error / self.loss_scale)
-                loss = loss.mean()
-            else:
-                # Legacy: clamp extreme errors (kills gradients)
-                ppm_error_clamped = torch.clamp(ppm_error, max=self.loss_scale)
-                loss = ppm_error_clamped.mean()
-        else:
-            # Use absolute error in Daltons
-            ppm_error = (mass_error / precursor_mass.clamp(min=1.0)) * 1e6
-            loss = mass_error.mean()
+        error_da = torch.abs(predicted_total - precursor_mass)
+        
+        # Scaled Loss
+        loss = (error_da * self.scale_factor).mean()
 
         metrics = {
-            'predicted_peptide_mass': predicted_peptide_mass.mean().item(),
-            'mass_error_da': mass_error.mean().item(),
-            'ppm_error': ppm_error.mean().item(),
+            'mass_error_da': error_da.mean().item(),
+            'precursor_loss': loss.item()
         }
 
         return loss, metrics
@@ -316,46 +258,21 @@ class PrecursorMassLoss(nn.Module):
 
 class CombinedLoss(nn.Module):
     """
-    Combined loss with all components.
-
-    Integrates:
-    - Deep Supervision (CE loss at all refinement steps)
-    - Gaussian Spectrum Matching (low variance, bounded)
-    - Log-scaled Precursor Loss (robust gradients, interpretable metrics)
+    Main entry point combining all loss components.
     """
 
     def __init__(
         self,
         ce_weight: float = 1.0,
-        spectrum_weight: float = 0.1,
-        precursor_weight: float = 0.0,
+        spectrum_weight: float = 0.5,    # Increased slightly as Cosine is [0,1]
+        precursor_weight: float = 0.1,
         iteration_weights: str = 'linear',
         label_smoothing: float = 0.0,
         # Spectrum args
-        bin_size: float = 0.1,
-        max_mz: float = 2000.0,
-        sigma: float = 0.05,
+        mass_tolerance: float = 0.1,     # Used as bin_size for gaussian
         ion_type_names: Optional[List[str]] = None,
         ms2pip_model: Optional[str] = None,
-        # Precursor args
-        precursor_use_log: bool = True,
-        precursor_scale: float = 100000.0,
     ):
-        """
-        Args:
-            ce_weight: Weight for cross-entropy loss
-            spectrum_weight: Weight for spectrum matching loss
-            precursor_weight: Weight for precursor mass loss
-            iteration_weights: Weighting scheme for supervision steps
-            label_smoothing: Label smoothing for cross-entropy
-            bin_size: Spectral grid resolution in Da
-            max_mz: Maximum m/z for spectrum rendering
-            sigma: Gaussian kernel width
-            ion_type_names: Ion types to use (e.g., ['b', 'y', 'b++', 'y++'])
-            ms2pip_model: MS2PIP model name (e.g., 'HCDch2')
-            precursor_use_log: Use log-scaling for precursor loss
-            precursor_scale: Scale parameter for precursor log loss
-        """
         super().__init__()
         self.ce_weight = ce_weight
         self.spectrum_weight = spectrum_weight
@@ -367,18 +284,14 @@ class CombinedLoss(nn.Module):
         )
 
         self.spectrum_loss = SpectrumMatchingLoss(
-            bin_size=bin_size,
-            max_mz=max_mz,
-            sigma=sigma,
+            bin_size=0.1,  # 0.1 Da resolution (good for MS/MS)
+            max_mz=2000.0,  # Cover typical peptide m/z range
+            sigma=0.05,  # Half the bin size for sharp peaks
             ion_type_names=ion_type_names,
             ms2pip_model=ms2pip_model,
         )
 
-        self.precursor_loss = PrecursorMassLoss(
-            use_relative=True,
-            loss_scale=precursor_scale,
-            use_log_loss=precursor_use_log,
-        )
+        self.precursor_loss = PrecursorMassLoss(scale_factor=0.004)
 
     def forward(
         self,
@@ -390,23 +303,18 @@ class CombinedLoss(nn.Module):
         peak_mask: Tensor,
         precursor_mass: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Dict[str, float]]:
-        """
-        Compute combined loss.
 
-        Returns:
-            total_loss: Scalar loss
-            metrics: Dict with component losses
-        """
         # 1. Deep Supervision (Cross Entropy)
         ce_loss, ce_metrics = self.ce_loss(all_logits, targets, target_mask)
 
-        # 2. Spectrum Loss & Precursor Loss on final prediction
+        # 2. Spectrum Loss & Precursor Loss
+        # We use the final iteration's prediction for auxiliary losses
         final_probs = F.softmax(all_logits[-1], dim=-1)
 
         # Ensure float32 for stability in exp() and sum() operations
         with torch.amp.autocast(enabled=False, device_type=ce_loss.device.type):
             final_probs_f32 = final_probs.float()
-
+            
             # Spectrum Loss
             if self.spectrum_weight > 0:
                 spec_loss = self.spectrum_loss(

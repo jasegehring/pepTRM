@@ -46,10 +46,14 @@ class SyntheticPeptideDataset(IterableDataset):
         include_neutral_losses: bool = False,
 
         # Difficulty parameters (for curriculum learning)
+        # These parameters only apply to NOISY examples
         noise_peaks: int = 0,
         peak_dropout: float = 0.0,
         mass_error_ppm: float = 0.0,
         intensity_variation: float = 0.0,
+
+        # Clean/Noisy mixing (for smooth curriculum transitions)
+        clean_data_ratio: float = 1.0,  # 1.0 = 100% clean, 0.0 = 100% noisy
 
         # Charge state distribution
         charge_distribution: Optional[dict[int, float]] = None,
@@ -61,11 +65,14 @@ class SyntheticPeptideDataset(IterableDataset):
         self.ion_types = ion_types or ['b', 'y']
         self.include_neutral_losses = include_neutral_losses
 
-        # Difficulty parameters
+        # Difficulty parameters (only for noisy samples)
         self.noise_peaks = noise_peaks
         self.peak_dropout = peak_dropout
         self.mass_error_ppm = mass_error_ppm
         self.intensity_variation = intensity_variation
+
+        # Clean/Noisy mixing ratio
+        self.clean_data_ratio = clean_data_ratio
 
         # Default charge distribution (charge 2 most common)
         self.charge_distribution = charge_distribution or {2: 0.7, 3: 0.25, 4: 0.05}
@@ -78,6 +85,7 @@ class SyntheticPeptideDataset(IterableDataset):
         peak_dropout: Optional[float] = None,
         mass_error_ppm: Optional[float] = None,
         intensity_variation: Optional[float] = None,
+        clean_data_ratio: Optional[float] = None,
     ):
         """Update difficulty parameters for curriculum learning."""
         if min_length is not None:
@@ -92,6 +100,8 @@ class SyntheticPeptideDataset(IterableDataset):
             self.mass_error_ppm = mass_error_ppm
         if intensity_variation is not None:
             self.intensity_variation = intensity_variation
+        if clean_data_ratio is not None:
+            self.clean_data_ratio = clean_data_ratio
 
     def _sample_charge(self) -> int:
         """Sample charge state from distribution."""
@@ -100,21 +110,25 @@ class SyntheticPeptideDataset(IterableDataset):
         return random.choices(charges, weights=probs, k=1)[0]
 
     def _generate_sample(self) -> PeptideSpectrumSample:
-        """Generate a single training sample."""
+        """Generate a single training sample with clean/noisy mixing."""
         # Generate random peptide
         peptide = generate_random_peptide(self.min_length, self.max_length)
         charge = self._sample_charge()
 
+        # Decide whether to generate clean or noisy data
+        use_clean = random.random() < self.clean_data_ratio
+
         # Generate theoretical spectrum
+        # If clean, use zero noise; if noisy, use configured noise parameters
         spectrum = generate_theoretical_spectrum(
             peptide=peptide,
             charge=charge,
             ion_types=self.ion_types,
             include_neutral_losses=self.include_neutral_losses,
-            noise_peaks=self.noise_peaks,
-            peak_dropout=self.peak_dropout,
-            mass_error_ppm=self.mass_error_ppm,
-            intensity_variation=self.intensity_variation,
+            noise_peaks=0 if use_clean else self.noise_peaks,
+            peak_dropout=0.0 if use_clean else self.peak_dropout,
+            mass_error_ppm=0.0 if use_clean else self.mass_error_ppm,
+            intensity_variation=0.0 if use_clean else self.intensity_variation,
         )
 
         # Convert peaks to tensors
