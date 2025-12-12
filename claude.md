@@ -138,30 +138,31 @@ Target: Loss < 0.3, Token accuracy > 80% after 500 steps
 
 **Full training** (with curriculum):
 ```bash
-python3 scripts/train.py
+python3 scripts/train_ms2pip.py
 ```
-50K steps, 3-stage curriculum, automatic difficulty progression
+100K steps, extended curriculum, automatic difficulty progression
 
 ### Configuration
 
-Edit `configs/default.yaml` to customize:
+Edit `configs/optimized_extended.yaml` to customize:
 - Model size (hidden_dim, num_layers, num_heads)
 - Training (batch_size, learning_rate)
-- Curriculum stages (enabled by default)
+- Curriculum stages
+- MS2PIP settings (ms2pip_model, top_k_peaks)
 - EMA settings (critical: keep enabled!)
 
 ### Key Files
 
 **Core Implementation**:
 - `src/constants.py`: Amino acid masses, vocabulary (CRITICAL - physics foundation)
-- `src/data/synthetic.py`: Forward model (peptide → spectrum)
+- `src/data/ms2pip_dataset.py`: MS2PIP-based data generation
 - `src/model/decoder.py`: Recursive core (TRM innovation)
 - `src/training/losses.py`: Deep supervision + spectrum matching
 
 **Entry Points**:
-- `scripts/train.py`: Main training
+- `scripts/train_ms2pip.py`: Main training script
 - `scripts/overfit_test.py`: Validation
-- `configs/default.yaml`: Configuration
+- `configs/optimized_extended.yaml`: Optimized configuration
 
 ---
 
@@ -170,7 +171,7 @@ Edit `configs/default.yaml` to customize:
 ### ✅ Implemented (MVP Complete)
 
 **Data Pipeline**:
-- Synthetic spectrum generator (b/y ions)
+- MS2PIP-based realistic spectrum generator
 - Sinusoidal mass embeddings
 - Infinite dataset with curriculum support
 

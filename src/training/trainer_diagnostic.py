@@ -20,6 +20,8 @@ from typing import Optional
 from dataclasses import dataclass
 from copy import deepcopy
 from tqdm import tqdm
+import torch.nn.functional as F
+import wandb
 
 from ..model.trm import RecursivePeptideModel
 from .losses import DeepSupervisionLoss, CombinedLoss
@@ -100,7 +102,7 @@ class EMA:
         self.shadow.load_state_dict(state_dict)
 
 
-class OptimizedTrainer:
+class DiagnosticTrainer:
     """
     Optimized trainer with AMP and compilation support.
     """
@@ -129,31 +131,18 @@ class OptimizedTrainer:
         self.device = torch.device(config.device)
         self.use_wandb = use_wandb
 
-        # Compile model if requested (BEFORE moving to device)
-        if config.use_compile and hasattr(torch, 'compile') and config.device == 'cuda':
-            print(f"🔧 Compiling model with mode='{config.compile_mode}'...")
-            print("   (First training step will be slow while compiling)")
-            try:
-                model = torch.compile(
-                    model,
-                    mode=config.compile_mode,
-                    fullgraph=False,  # Allow fallback for dynamic ops
-                )
-                print("   ✓ Model compiled successfully")
-            except Exception as e:
-                print(f"   ⚠️  Compilation failed: {e}")
-                print("   Continuing without compilation...")
-                config.use_compile = False
+        # Force disable compilation for diagnostics to ensure clear stack traces
+        config.use_compile = False
+        print("--- RUNNING IN DIAGNOSTIC MODE ---")
+        print("   - torch.compile disabled")
+        print("   - Logging intermediate values every step")
+        print("---------------------------------")
 
         self.model = model.to(self.device)
 
         # Mixed precision setup
         self.use_amp = config.use_amp and config.device == 'cuda'
         self.scaler = GradScaler('cuda', enabled=self.use_amp) if self.use_amp else None
-
-        if self.use_amp:
-            print(f"⚡ Mixed precision training enabled ({config.amp_dtype})")
-            print(f"   Expected speedup: 2-3x faster")
 
         # Datasets and loaders
         self.train_loader = train_loader
@@ -174,28 +163,18 @@ class OptimizedTrainer:
             eta_min=config.learning_rate * 0.01,
         )
 
-        # Loss (with ion type configuration)
-        if config.spectrum_weight > 0 or config.use_curriculum:
-            self.loss_fn = CombinedLoss(
-                ce_weight=config.ce_weight,
-                spectrum_weight=config.spectrum_weight,
-                iteration_weights=config.iteration_weights,
-                label_smoothing=config.label_smoothing,
-                ms2pip_model=config.ms2pip_model,  # Auto-select ion types (e.g., HCDch2)
-            ).to(self.device)
-            self.use_combined_loss = True
-            print(f"📊 Ion types for spectrum matching: {get_ion_types_for_model(config.ms2pip_model)}")
-        else:
-            self.loss_fn = DeepSupervisionLoss(
-                iteration_weights=config.iteration_weights,
-                label_smoothing=config.label_smoothing,
-            ).to(self.device)
-            self.use_combined_loss = False
+        # Loss
+        self.loss_fn = CombinedLoss(
+            ce_weight=config.ce_weight,
+            spectrum_weight=config.spectrum_weight,
+            iteration_weights=config.iteration_weights,
+            label_smoothing=config.label_smoothing,
+            ms2pip_model=config.ms2pip_model,
+        ).to(self.device)
+        self.use_combined_loss = True
 
         # Curriculum scheduler
         self.curriculum = curriculum
-        if self.curriculum:
-            print(f"📚 Curriculum enabled ({self.curriculum.total_steps} total steps)")
 
         # EMA
         self.ema = None
@@ -214,15 +193,9 @@ class OptimizedTrainer:
         if self.use_wandb:
             try:
                 import wandb
-                tags = ['optimized']
-                if self.use_amp:
-                    tags.append('amp')
-                if config.use_compile:
-                    tags.append('compiled')
-                tags.append(f'batch_{config.batch_size}')
-
+                tags = ['diagnostic'] # Tag this run as a diagnostic run
                 wandb.init(
-                    project="peptide-trm",
+                    project="peptide-trm-diagnostic", # Use a separate project
                     config=vars(config),
                     tags=tags,
                 )
@@ -231,89 +204,105 @@ class OptimizedTrainer:
                 self.use_wandb = False
 
     def train_step(self, batch):
-        """Single training step with mixed precision."""
+        """Single training step with extensive diagnostic logging."""
         self.model.train()
-
-        # Move to device
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
-        # --- FIX: Calculate precursor m/z for model input ---
-        # The model encoder expects precursor m/z to be on the same scale as fragment m/z.
-        # The loss function still needs the neutral mass.
+        # --- DIAGNOSTIC LOGGING: INPUTS ---
         precursor_neutral_mass = batch['precursor_mass']
         precursor_charge = batch['precursor_charge']
-        # m/z = (M + z*H) / z
         precursor_mz = (precursor_neutral_mass + precursor_charge * PROTON_MASS) / precursor_charge
+        
+        diag_log = {}
+        if self.use_wandb:
+            diag_log.update({
+                'diag/input_precursor_neutral_mass': precursor_neutral_mass.mean().item(),
+                'diag/input_precursor_charge': precursor_charge.float().mean().item(),
+                'diag/input_precursor_mz': precursor_mz.mean().item(),
+            })
 
-        # Mixed precision forward pass
+        # --- FORWARD PASS ---
         with autocast('cuda', enabled=self.use_amp, dtype=torch.float16 if self.use_amp else torch.float32):
-            # Forward
             all_logits, _ = self.model(
                 spectrum_masses=batch['spectrum_masses'],
                 spectrum_intensities=batch['spectrum_intensities'],
                 spectrum_mask=batch['spectrum_mask'],
-                precursor_mass=precursor_mz,  # Pass m/z to model
+                precursor_mass=precursor_mz,
                 precursor_charge=precursor_charge,
             )
 
-            # Update curriculum
-            if self.curriculum:
-                if self.curriculum.step(self.global_step):
-                    if self.use_combined_loss:
-                        self.loss_fn.spectrum_weight = self.curriculum.get_spectrum_loss_weight()
-                        self.loss_fn.precursor_weight = self.curriculum.get_precursor_loss_weight()
+            # --- CURRICULUM UPDATE ---
+            if self.curriculum and self.curriculum.step(self.global_step):
+                self.loss_fn.spectrum_weight = self.curriculum.get_spectrum_loss_weight()
+                self.loss_fn.precursor_weight = self.curriculum.get_precursor_loss_weight()
 
-            # Compute loss
-            if self.use_combined_loss:
-                loss, metrics = self.loss_fn(
-                    all_logits=all_logits,
-                    targets=batch['sequence'],
-                    target_mask=batch['sequence_mask'],
-                    observed_masses=batch['spectrum_masses'],
-                    observed_intensities=batch['spectrum_intensities'],
-                    peak_mask=batch['spectrum_mask'],
-                    precursor_mass=precursor_neutral_mass.squeeze(-1),  # Pass neutral mass to loss
-                )
-            else:
-                loss, metrics = self.loss_fn(
-                    all_logits=all_logits,
-                    targets=batch['sequence'],
-                    target_mask=batch['sequence_mask'],
-                )
-
-            # Gradient accumulation scaling
+            # --- LOSS COMPUTATION ---
+            loss, metrics = self.loss_fn(
+                all_logits=all_logits,
+                targets=batch['sequence'],
+                target_mask=batch['sequence_mask'],
+                observed_masses=batch['spectrum_masses'],
+                observed_intensities=batch['spectrum_intensities'],
+                peak_mask=batch['spectrum_mask'],
+                precursor_mass=precursor_neutral_mass.squeeze(-1),
+            )
+            
+            # --- DIAGNOSTIC LOGGING: LOSS & METRICS ---
+            if self.use_wandb:
+                # Log final probabilities
+                final_probs = F.softmax(all_logits[-1], dim=-1).float()
+                diag_log.update({
+                    'diag/final_probs_min': final_probs.min().item(),
+                    'diag/final_probs_max': final_probs.max().item(),
+                    'diag/final_probs_mean': final_probs.mean().item(),
+                })
+                # Log all metrics from the loss function
+                for k, v in metrics.items():
+                    diag_log[f'diag/{k}'] = v
+                wandb.log(diag_log, step=self.global_step)
+            
             if self.config.gradient_accumulation_steps > 1:
                 loss = loss / self.config.gradient_accumulation_steps
 
-        # Backward pass with gradient scaling
+        # --- BACKWARD PASS ---
         if self.use_amp:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
 
-        # Optimizer step (only every N accumulation steps)
+        # --- OPTIMIZER STEP ---
         if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+            # Unscale and clip grads
             if self.use_amp:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            # --- DIAGNOSTIC LOGGING: GRADIENTS ---
+            if self.use_wandb:
+                total_grad_norm = 0.0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        total_grad_norm += p.grad.data.norm(2).item() ** 2
+                total_grad_norm = total_grad_norm ** 0.5
+                wandb.log({'diag/gradient_norm': total_grad_norm}, step=self.global_step)
+
+            # Step optimizer
+            if self.use_amp:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
             self.optimizer.zero_grad()
             self.scheduler.step()
 
-            # Update EMA
             if self.ema:
                 self.ema.update(self.model)
 
-        # Compute accuracy metrics (in FP32 for precision)
+        # --- ACCURACY METRICS ---
         with torch.no_grad():
-            final_logits = all_logits[-1].float()  # Last iteration
             acc_metrics = compute_metrics(
-                logits=final_logits,
+                logits=all_logits[-1].float(),
                 targets=batch['sequence'],
                 mask=batch['sequence_mask'],
             )
@@ -500,46 +489,26 @@ class OptimizedTrainer:
         if self.scaler:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
 
-        # Save curriculum state
-        if self.curriculum:
-            checkpoint['curriculum_stage_idx'] = self.curriculum.current_stage_idx
-
         torch.save(checkpoint, self.checkpoint_dir / filename)
         tqdm.write(f"Saved checkpoint: {filename}")
 
-    def load_checkpoint(self, checkpoint_path: str, load_curriculum=True):
-        """
-        Load training state from a checkpoint.
-
-        Args:
-            checkpoint_path: Path to checkpoint file
-            load_curriculum: If True, restore curriculum state. If False, start curriculum
-                           from current step (useful for testing different curricula)
-        """
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load training state from a checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-
+        
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
+        
         if self.scaler and 'scaler_state_dict' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-
+            
         if self.ema and 'ema_state_dict' in checkpoint:
             self.ema.load_state_dict(checkpoint['ema_state_dict'])
-
+            
         self.global_step = checkpoint['step']
         self.best_val_acc = checkpoint['best_val_acc']
-
-        # Optionally restore curriculum state
-        if load_curriculum and self.curriculum and 'curriculum_stage_idx' in checkpoint:
-            self.curriculum.current_stage_idx = checkpoint['curriculum_stage_idx']
-            print(f"  Curriculum stage: {self.curriculum.current_stage_idx}")
-        elif not load_curriculum and self.curriculum:
-            # Update curriculum based on current step (for testing new curricula)
-            self.curriculum.step(self.global_step)
-            print(f"  Curriculum reset to step {self.global_step}")
-
+        
         print(f"\n✓ Resumed training from checkpoint: {checkpoint_path}")
         print(f"  Starting from step: {self.global_step}")
         print(f"  Best validation accuracy: {self.best_val_acc:.3f}")

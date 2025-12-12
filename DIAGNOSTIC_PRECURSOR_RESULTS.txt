@@ -1,0 +1,15 @@
+DIAGNOSTIC TEST 1: WRONG PRECURSOR MASS
+================================================================================
+
+Checkpoint: best_model.pt
+Samples per offset: 500
+
+RESULTS:
+    +0.0 Da: Token=96.18%, Seq=65.80%
+   +10.0 Da: Token=95.39%, Seq=59.40%
+   +25.0 Da: Token=95.32%, Seq=61.20%
+   +50.0 Da: Token=95.66%, Seq=63.60%
+  +100.0 Da: Token=96.06%, Seq=66.60%
+   -50.0 Da: Token=95.47%, Seq=60.80%
+
+Token accuracy drop with +100 Da: 0.1%

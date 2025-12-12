@@ -41,7 +41,7 @@ class SyntheticPeptideDataset(IterableDataset):
 
         # Spectrum parameters
         max_peaks: int = 100,
-        max_seq_len: int = 25,
+        max_seq_len: int = 35,  # Increased to handle longer peptides
         ion_types: list[str] = None,
         include_neutral_losses: bool = False,
 

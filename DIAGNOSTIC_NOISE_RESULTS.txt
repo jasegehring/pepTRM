@@ -1,0 +1,24 @@
+DIAGNOSTIC TEST 3: NOISE DECOMPOSITION & CHARGE STATE
+================================================================================
+
+Checkpoint: best_model.pt
+Samples per config: 500
+
+NOISE DECOMPOSITION:
+  Clean (baseline)              : Token=69.04%, Seq=44.40%
+  Dropout only (15%)            : Token=47.53%, Seq= 6.60%
+  Noise peaks only (10)         : Token=47.85%, Seq= 5.00%
+  Mass error only (15ppm)       : Token=67.44%, Seq=40.60%
+  Dropout + Noise peaks         : Token=38.84%, Seq= 1.20%
+  Dropout + Mass error          : Token=45.24%, Seq= 5.40%
+  Noise peaks + Mass error      : Token=46.04%, Seq= 3.80%
+  ALL (realistic)               : Token=36.70%, Seq= 0.40%
+
+CHARGE STATE ANALYSIS:
+  Charge +2 only (clean)        : Token=69.59%, Seq=44.60%
+  Charge +3 only (clean)        : Token=68.35%, Seq=41.80%
+  Charge +2 only (realistic)    : Token=37.07%, Seq= 0.40%
+  Charge +3 only (realistic)    : Token=37.96%, Seq= 0.40%
+
+Worst noise type: Dropout (Δ=21.50%)
+Noise synergy: -11.95%

@@ -6,7 +6,21 @@ import torch
 from torch import Tensor
 from typing import Optional
 
-from ..constants import PAD_IDX, EOS_IDX, IDX_TO_AA, AMINO_ACID_MASSES, WATER_MASS
+from ..constants import PAD_IDX, EOS_IDX, IDX_TO_AA, AA_TO_IDX, AMINO_ACID_MASSES, WATER_MASS
+
+
+def normalize_il_ambiguity(tokens: Tensor) -> Tensor:
+    """
+    Normalize I/L ambiguity by replacing all I with L.
+
+    Isoleucine and Leucine have identical mass and are indistinguishable
+    in mass spectrometry, so they should be treated as equivalent in metrics.
+    """
+    normalized = tokens.clone()
+    i_idx = AA_TO_IDX['I']
+    l_idx = AA_TO_IDX['L']
+    normalized[tokens == i_idx] = l_idx
+    return normalized
 
 
 def token_accuracy(
@@ -17,12 +31,19 @@ def token_accuracy(
     """
     Per-amino-acid accuracy (ignoring padding).
 
+    Treats I/L as equivalent since they are indistinguishable by mass.
+
     Args:
         logits: (batch, seq_len, vocab)
         targets: (batch, seq_len)
         mask: (batch, seq_len)
     """
     predictions = logits.argmax(dim=-1)
+
+    # Normalize I/L ambiguity
+    predictions = normalize_il_ambiguity(predictions)
+    targets = normalize_il_ambiguity(targets)
+
     correct = (predictions == targets) & mask
     return correct.sum().item() / mask.sum().item()
 
@@ -34,8 +55,14 @@ def sequence_accuracy(
 ) -> float:
     """
     Fraction of perfectly reconstructed sequences.
+
+    Treats I/L as equivalent since they are indistinguishable by mass.
     """
     predictions = logits.argmax(dim=-1)
+
+    # Normalize I/L ambiguity
+    predictions = normalize_il_ambiguity(predictions)
+    targets = normalize_il_ambiguity(targets)
 
     # For each sequence, check if all masked positions match
     correct = (predictions == targets) | ~mask

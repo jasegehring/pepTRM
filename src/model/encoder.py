@@ -80,7 +80,8 @@ class SpectrumEncoder(nn.Module):
 
         # Encode precursor and add as first token
         precursor_emb = self.precursor_encoder(precursor_mass, precursor_charge)  # (batch, hidden)
-        precursor_token = self.precursor_token.expand(batch_size, -1, -1)  # (batch, 1, hidden)
+        # Use repeat instead of expand for torch.compile compatibility
+        precursor_token = self.precursor_token.repeat(batch_size, 1, 1)  # (batch, 1, hidden)
         precursor_token = precursor_token + precursor_emb.unsqueeze(1)
 
         # Concatenate: [precursor, peaks...]

@@ -6,7 +6,7 @@ model:
   num_decoder_layers: 2
   num_heads: 4
   max_peaks: 100
-  max_seq_len: 25
+  max_seq_len: 35  # Increased to handle longer peptides
   max_mass: 2000.0
   vocab_size: 24  # 20 AA + 4 special tokens
   num_supervision_steps: 8

@@ -2,33 +2,33 @@
 # Expected training time: ~2.5 hours for 100K steps (vs ~7 hours without optimizations)
 
 model:
-  hidden_dim: 256
-  num_encoder_layers: 2
-  num_decoder_layers: 2
-  num_heads: 4
+  hidden_dim: 384  # INCREASED from 256 (1.5x capacity)
+  num_encoder_layers: 3  # INCREASED from 2 (more expressiveness)
+  num_decoder_layers: 3  # INCREASED from 2 (more expressiveness)
+  num_heads: 6  # INCREASED from 4 (384/6 = 64 per head)
   max_peaks: 100
-  max_seq_len: 25
+  max_seq_len: 35  # Supports peptides up to 30aa (with SOS/EOS/padding)
   num_supervision_steps: 8
-  num_latent_steps: 4
+  num_latent_steps: 6  # INCREASED from 4 (original TRM value)
   dropout: 0.1
 
 training:
   # Optimization (3x faster!)
   learning_rate: 1.5e-4  # Slightly higher for larger batch
   weight_decay: 0.01
-  batch_size: 192  # 3x larger than baseline (optimized for RTX 4090)
+  batch_size: 96  # Safe for TRM's high memory usage (8 supervision + 6 latent steps)
   max_steps: 100000  # 2x longer training
   warmup_steps: 2000  # Proportional increase
 
   # Mixed Precision (NEW - 2-3x speedup)
   use_amp: true
-  amp_dtype: 'float16'  # Use 'bfloat16' if available
+  amp_dtype: 'bfloat16'  # Use 'bfloat16' if available
 
   # Gradient Accumulation (if batch too large)
   gradient_accumulation_steps: 1
 
-  # Model Compilation (NEW - 1.2-1.5x speedup)
-  use_compile: true
+  # Model Compilation (DISABLED - not needed, saves memory)
+  use_compile: false
   compile_mode: 'max-autotune'
 
   # Loss configuration
@@ -56,15 +56,11 @@ training:
   device: 'cuda'
 
 data:
-  # Initial curriculum stage (will be updated automatically)
-  min_length: 7
-  max_length: 10
-  ion_types: ['b', 'y']
-  include_neutral_losses: false
-  noise_peaks: 0
-  peak_dropout: 0.0
-  mass_error_ppm: 0.0
-  intensity_variation: 0.0
+  # MS2PIP-specific settings
+  ms2pip_model: 'HCDch2'  # UPDATED: Use HCDch2 for b, y, b++, y++ ions
+  top_k_peaks: 50
+
+  # Charge distribution
   charge_distribution:
     2: 0.7
     3: 0.3

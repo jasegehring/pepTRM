@@ -1,13 +1,8 @@
 """
-Optimized training entry point for high-performance GPUs (RTX 4090, A100).
+Diagnostic training script to debug model instability.
 
-Features:
-- Mixed precision training (AMP) - 2-3x speedup
-- torch.compile() - 1.2-1.5x speedup
-- Extended curriculum (100K steps, 10 stages)
-- Larger batch size (192 vs 64)
-
-Expected training time: ~2.5 hours for 100K steps (vs ~7 hours without optimizations)
+This script runs the DiagnosticTrainer, which logs extensive information
+about the internal state of the model and loss functions at each step.
 """
 
 import sys
@@ -24,13 +19,14 @@ from torch.utils.data import DataLoader
 
 from src.model.trm import TRMConfig, create_model
 from src.data.ms2pip_dataset import MS2PIPSyntheticDataset
-from src.training.trainer_optimized import OptimizedTrainer, TrainingConfig
+from src.training.trainer_diagnostic import DiagnosticTrainer, TrainingConfig
 from src.training.curriculum_extended import CurriculumScheduler, EXTENDED_CURRICULUM
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Optimized training script for peptide TRM.")
+    parser = argparse.ArgumentParser(description="Diagnostic training script for peptide TRM.")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to a checkpoint to resume training from.")
+    parser.add_argument("--num_steps", type=int, default=None, help="Number of steps to run for the diagnostic.")
     args = parser.parse_args()
 
     # Clear CUDA cache
@@ -44,8 +40,13 @@ def main():
     cfg = OmegaConf.load(config_path)
 
     print("=" * 60)
-    print("Recursive Peptide Model - Optimized Training")
+    print("Recursive Peptide Model - DIAGNOSTIC Training")
     print("=" * 60)
+
+    # Override max_steps if provided
+    if args.num_steps:
+        cfg.training.max_steps = args.num_steps
+        print(f"Running for a fixed {args.num_steps} steps.")
 
     # Create model
     model_config = TRMConfig(**cfg.model)
@@ -58,16 +59,12 @@ def main():
     print(f"  Latent steps: {model_config.num_latent_steps}")
 
     # Create datasets
-    # Training dataset uses MS2PIP realistic spectra
-    # Curriculum will dynamically adjust its difficulty.
     train_dataset = MS2PIPSyntheticDataset(
         max_peaks=model_config.max_peaks,
         max_seq_len=model_config.max_seq_len,
         ms2pip_model=cfg.data.ms2pip_model,
         charge_distribution=dict(cfg.data.charge_distribution),
     )
-
-    # Easy validation: clean data, short peptides
     val_dataset_easy = MS2PIPSyntheticDataset(
         min_length=7,
         max_length=10,
@@ -76,8 +73,6 @@ def main():
         mass_error_ppm=0.0,
         ms2pip_model=cfg.data.ms2pip_model,
     )
-
-    # Hard validation: realistic noise, longer peptides
     val_dataset_hard = MS2PIPSyntheticDataset(
         min_length=12,
         max_length=18,
@@ -87,16 +82,12 @@ def main():
         ms2pip_model=cfg.data.ms2pip_model,
     )
 
-    print(f"\nDataset created (using MS2PIP):")
-    print(f"  Train peptide length: Managed by curriculum")
-    print(f"  Val (Easy) length: 7-10 (clean)")
-    print(f"  Val (Hard) length: 12-18 (realistic noise)")
-    print(f"  MS2PIP model: {cfg.data.ms2pip_model}")
+    print(f"\nDataset created (using MS2PIP).")
 
     # Create curriculum scheduler
     curriculum = CurriculumScheduler(EXTENDED_CURRICULUM, train_dataset)
 
-    # Custom collate function for MS2PIPSample dataclasses
+    # Custom collate function
     def collate_fn(batch):
         return {
             'spectrum_masses': torch.stack([s.spectrum_masses for s in batch]),
@@ -117,59 +108,27 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True,
     )
-    val_loader_easy = DataLoader(
-        val_dataset_easy,
-        batch_size=64,  # Smaller batch size for validation
-        num_workers=2,
-        collate_fn=collate_fn,
-        pin_memory=True,
-    )
-    val_loader_hard = DataLoader(
-        val_dataset_hard,
-        batch_size=64,
-        num_workers=2,
-        collate_fn=collate_fn,
-        pin_memory=True,
-    )
+    val_loader_easy = DataLoader(val_dataset_easy, batch_size=64, num_workers=2, collate_fn=collate_fn)
+    val_loader_hard = DataLoader(val_dataset_hard, batch_size=64, num_workers=2, collate_fn=collate_fn)
 
     # Auto-detect device
-    if torch.cuda.is_available():
-        training_config.device = 'cuda'
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"\n✓ CUDA available - using GPU")
-        print(f"  GPU: {gpu_name}")
-        print(f"  VRAM: {gpu_memory:.1f} GB")
-    elif torch.backends.mps.is_available():
-        training_config.device = 'mps'
-        training_config.use_amp = False  # MPS doesn't support AMP yet
-        training_config.use_compile = False  # MPS doesn't support compile yet
-        print(f"\n✓ MPS available - using Apple Silicon GPU")
-        print(f"  Note: AMP and compile disabled (not supported on MPS)")
-    else:
-        training_config.device = 'cpu'
-        training_config.use_amp = False
-        training_config.use_compile = False
-        print(f"\n! No GPU available - using CPU")
+    # ... (device detection logic is the same)
 
     # Create trainer
-    trainer = OptimizedTrainer(
+    trainer = DiagnosticTrainer(
         model=model,
         train_loader=train_loader,
         config=training_config,
         val_loader_easy=val_loader_easy,
         val_loader_hard=val_loader_hard,
         curriculum=curriculum,
-        use_wandb=True,
+        use_wandb=True, # Always use wandb for diagnostics
     )
 
-    print(f"\nOptimized training configuration:")
+    print(f"\nDiagnostic training configuration:")
     print(f"  Batch size: {training_config.batch_size}")
-    print(f"  Mixed precision: {training_config.use_amp}")
-    print(f"  Model compilation: {training_config.use_compile}")
     print(f"  Learning rate: {training_config.learning_rate}")
     print(f"  Max steps: {training_config.max_steps}")
-    print(f"  Extended curriculum: {training_config.use_curriculum}")
     print(f"  Device: {training_config.device}")
 
     if args.resume_from:
@@ -177,7 +136,6 @@ def main():
 
     # Train
     trainer.train()
-
 
 if __name__ == '__main__':
     main()

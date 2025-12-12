@@ -16,16 +16,16 @@ from ..constants import VOCAB_SIZE
 @dataclass
 class TRMConfig:
     """Model configuration."""
-    hidden_dim: int = 256
-    num_encoder_layers: int = 2
-    num_decoder_layers: int = 2
-    num_heads: int = 4
+    hidden_dim: int = 384  # INCREASED from 256 (1.5x capacity)
+    num_encoder_layers: int = 3  # INCREASED from 2
+    num_decoder_layers: int = 3  # INCREASED from 2
+    num_heads: int = 6  # INCREASED from 4 (384/6 = 64 per head)
     max_peaks: int = 100
-    max_seq_len: int = 25
+    max_seq_len: int = 35  # Supports peptides up to 30aa
     max_mass: float = 2000.0
     vocab_size: int = VOCAB_SIZE
     num_supervision_steps: int = 8
-    num_latent_steps: int = 4  # MVP: 4 instead of 6
+    num_latent_steps: int = 6  # INCREASED from 4 (original TRM value)
     dropout: float = 0.1
 
 

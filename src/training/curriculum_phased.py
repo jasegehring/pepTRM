@@ -1,11 +1,11 @@
 """
-Extended, smoother curriculum learning scheduler.
+Phased curriculum with delayed auxiliary loss introduction.
 
-Improvements over default curriculum:
-1. Longer stages (100K steps total vs 50K)
-2. Smoother transitions (more intermediate stages)
-3. Gradual noise introduction (0→1→2→3→5→8 peaks)
-4. Better sim-to-real transfer
+Based on gradient information analysis, this curriculum introduces:
+- Spectrum loss @ step 15k (55% accuracy, gradient strength 0.25)
+- Precursor loss @ step 30k (70% accuracy, gradient strength 0.59)
+
+This provides clearer, more actionable gradients compared to early introduction.
 """
 
 from dataclasses import dataclass
@@ -38,139 +38,155 @@ class CurriculumStage:
     precursor_loss_weight: float = 0.0
 
 
-# Extended 10-stage curriculum for smoother sim-to-real transfer
-EXTENDED_CURRICULUM = [
-    # Stage 1 (0-10K): Foundation - Pure CE on clean data
+# Phased 10-stage curriculum with delayed auxiliary loss introduction
+PHASED_CURRICULUM = [
+    # ========================================================================
+    # PHASE 1: FOUNDATION (0-15k) - Pure CE, Build Stable Representations
+    # ========================================================================
+
+    # Stage 1 (0-7.5k): Foundation - Learn basic token distributions
     CurriculumStage(
         name="stage_1_foundation",
-        steps=10000,
+        steps=7500,
         min_length=7,
         max_length=10,
         noise_peaks=0,
         peak_dropout=0.0,
         mass_error_ppm=0.0,
-        spectrum_loss_weight=0.0,  # Pure CE first
-        precursor_loss_weight=0.0,  # No mass constraint yet
+        spectrum_loss_weight=0.0,  # Pure CE
+        precursor_loss_weight=0.0,
     ),
 
-    # Stage 2 (10K-20K): Spectrum matching only - Let CE learning stabilize
+    # Stage 2 (7.5k-15k): Stabilization - Let model reach ~55% accuracy
     CurriculumStage(
-        name="stage_2_spectrum",
-        steps=10000,  # 10K-20K
+        name="stage_2_stabilization",
+        steps=7500,  # 7.5k-15k
         min_length=7,
         max_length=10,
         noise_peaks=0,
         peak_dropout=0.0,
         mass_error_ppm=0.0,
-        spectrum_loss_weight=0.05,   # Learn fragment mass constraints
-        precursor_loss_weight=0.0,   # DELAYED: Wait for higher accuracy (see stage 3)
+        spectrum_loss_weight=0.0,  # Still pure CE
+        precursor_loss_weight=0.0,
     ),
 
-    # Stage 3 (20K-30K): Introduce precursor loss + minimal noise
+    # ========================================================================
+    # PHASE 2: FRAGMENT PHYSICS (15k-30k) - Introduce Spectrum Loss
+    # ========================================================================
+
+    # Stage 3 (15k-22.5k): Spectrum introduction - Gentle start
     CurriculumStage(
-        name="stage_3_precursor_intro",
-        steps=10000,  # 20K-30K
+        name="stage_3_spectrum_intro",
+        steps=7500,  # 15k-22.5k
         min_length=7,
         max_length=11,
-        noise_peaks=1,  # Just 1 noise peak
+        noise_peaks=1,  # Minimal noise
         peak_dropout=0.02,
         mass_error_ppm=2.0,
-        spectrum_loss_weight=0.08,
-        precursor_loss_weight=0.01,  # START HERE: ~60% token acc, clearer gradient signal
+        spectrum_loss_weight=0.08,  # START: Gradient strength ~0.25 at 55% acc
+        precursor_loss_weight=0.0,  # Not yet
     ),
 
-    # Stage 4 (30K-40K): Light noise - Gradual increase
+    # Stage 4 (22.5k-30k): Spectrum ramp-up
     CurriculumStage(
-        name="stage_4_light_noise",
-        steps=10000,  # 30K-40K
+        name="stage_4_spectrum_ramp",
+        steps=7500,  # 22.5k-30k
         min_length=7,
         max_length=12,
-        noise_peaks=2,  # Increase to 2
+        noise_peaks=2,
         peak_dropout=0.05,
         mass_error_ppm=5.0,
-        spectrum_loss_weight=0.10,
-        precursor_loss_weight=0.02,  # REDUCED: Error should be <50k ppm by now
+        spectrum_loss_weight=0.12,  # Increase: Model at ~65% acc
+        precursor_loss_weight=0.0,
     ),
 
-    # Stage 5 (40K-50K): Mild noise - Continue gradual ramp
+    # ========================================================================
+    # PHASE 3: TOTAL MASS CONSTRAINT (30k-45k) - Introduce Precursor Loss
+    # ========================================================================
+
+    # Stage 5 (30k-37.5k): Precursor introduction - Model at ~70% accuracy
     CurriculumStage(
-        name="stage_5_mild_noise",
-        steps=10000,  # 40K-50K
+        name="stage_5_precursor_intro",
+        steps=7500,  # 30k-37.5k
         min_length=7,
         max_length=13,
-        noise_peaks=3,  # NEW intermediate stage
+        noise_peaks=3,
         peak_dropout=0.08,
         mass_error_ppm=7.5,
-        spectrum_loss_weight=0.12,
-        precursor_loss_weight=0.025,  # REDUCED: Error should be <20k ppm by now
+        spectrum_loss_weight=0.15,
+        precursor_loss_weight=0.01,  # START: Gradient strength ~0.59 at 70% acc
     ),
 
-    # Stage 6 (50K-60K): Moderate noise - Bridge to realistic
+    # Stage 6 (37.5k-45k): Precursor ramp-up
     CurriculumStage(
-        name="stage_6_moderate_noise",
-        steps=10000,  # 50K-60K
+        name="stage_6_precursor_ramp",
+        steps=7500,  # 37.5k-45k
         min_length=7,
         max_length=14,
-        noise_peaks=5,  # Was causing issues before
+        noise_peaks=5,
         peak_dropout=0.10,
         mass_error_ppm=10.0,
-        spectrum_loss_weight=0.13,
-        precursor_loss_weight=0.03,  # REDUCED: Error should be <10k ppm by now
+        spectrum_loss_weight=0.18,
+        precursor_loss_weight=0.02,  # Model at ~75% acc
     ),
 
-    # Stage 7 (60K-70K): Moderate-high noise
+    # ========================================================================
+    # PHASE 4: FULL MULTI-TASK LEARNING (45k-100k) - All Losses Active
+    # ========================================================================
+
+    # Stage 7 (45k-55k): Moderate-high noise
     CurriculumStage(
         name="stage_7_moderate_high",
-        steps=10000,  # 60K-70K
+        steps=10000,  # 45k-55k
         min_length=7,
         max_length=15,
-        noise_peaks=6,  # NEW intermediate stage
+        noise_peaks=6,
         peak_dropout=0.12,
         mass_error_ppm=12.0,
-        spectrum_loss_weight=0.14,
-        precursor_loss_weight=0.04,  # REDUCED: Error should be <5k ppm by now
+        spectrum_loss_weight=0.20,
+        precursor_loss_weight=0.03,
     ),
 
-    # Stage 8 (70K-80K): High noise
+    # Stage 8 (55k-67.5k): High noise
     CurriculumStage(
         name="stage_8_high_noise",
-        steps=10000,  # 70K-80K
+        steps=12500,  # 55k-67.5k
         min_length=7,
         max_length=16,
-        noise_peaks=7,  # NEW intermediate stage
+        noise_peaks=7,
         peak_dropout=0.13,
         mass_error_ppm=13.0,
         intensity_variation=0.1,
-        spectrum_loss_weight=0.14,
-        precursor_loss_weight=0.05,  # REDUCED: Error should be <1k ppm by now
+        spectrum_loss_weight=0.22,
+        precursor_loss_weight=0.05,
     ),
 
-    # Stage 9 (80K-90K): Near-realistic
+    # Stage 9 (67.5k-82.5k): Near-realistic
     CurriculumStage(
         name="stage_9_near_realistic",
-        steps=10000,  # 80K-90K
+        steps=15000,  # 67.5k-82.5k
         min_length=7,
         max_length=17,
         noise_peaks=8,
         peak_dropout=0.14,
         mass_error_ppm=14.0,
         intensity_variation=0.15,
-        spectrum_loss_weight=0.15,
-        precursor_loss_weight=0.06,  # REDUCED: Error should be <500 ppm by now
+        spectrum_loss_weight=0.24,
+        precursor_loss_weight=0.06,
     ),
 
-    # Stage 10 (90K-100K): Fully realistic
+    # Stage 10 (82.5k-100k): Fully realistic
     CurriculumStage(
         name="stage_10_realistic",
-        steps=10000,  # 90K-100K
+        steps=17500,  # 82.5k-100k
         min_length=7,
         max_length=18,
-        noise_peaks=10,  # Even more realistic
+        noise_peaks=10,
         peak_dropout=0.15,
         mass_error_ppm=15.0,
         intensity_variation=0.2,
-        spectrum_loss_weight=0.15,
-        precursor_loss_weight=0.08,  # REDUCED: Final weight (error should be <100 ppm)
+        spectrum_loss_weight=0.25,  # Final weight
+        precursor_loss_weight=0.08,  # Final weight
     ),
 ]
 
@@ -188,7 +204,7 @@ class CurriculumScheduler:
         stages: list[CurriculumStage] = None,
         dataset: SyntheticPeptideDataset = None,
     ):
-        self.stages = stages or EXTENDED_CURRICULUM
+        self.stages = stages or PHASED_CURRICULUM
         self.dataset = dataset
         self.current_stage_idx = -1
         self._cumulative_steps = self._compute_cumulative_steps()
@@ -256,6 +272,7 @@ class CurriculumScheduler:
                 f"  Mass error: {stage.mass_error_ppm} ppm\n"
                 f"  Intensity variation: {stage.intensity_variation:.1%}\n"
                 f"  Spectrum loss weight: {stage.spectrum_loss_weight}\n"
+                f"  Precursor loss weight: {stage.precursor_loss_weight}\n"
                 f"{'='*60}"
             )
 

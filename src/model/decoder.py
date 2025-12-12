@@ -26,7 +26,7 @@ class RecursiveDecoder(nn.Module):
         hidden_dim: int = 256,
         num_layers: int = 2,
         num_heads: int = 4,
-        max_seq_len: int = 25,
+        max_seq_len: int = 35,  # Increased to handle longer peptides
         vocab_size: int = VOCAB_SIZE,
         dropout: float = 0.1,
     ):
@@ -168,7 +168,7 @@ class RecursiveCore(nn.Module):
         hidden_dim: int = 256,
         num_layers: int = 2,
         num_heads: int = 4,
-        max_seq_len: int = 25,
+        max_seq_len: int = 35,  # Increased to handle longer peptides
         vocab_size: int = VOCAB_SIZE,
         num_latent_steps: int = 4,  # MVP: 4 instead of 6
         dropout: float = 0.1,
