@@ -1,17 +1,11 @@
 """
-FINAL AUTHORITATIVE CURRICULUM - Combines all lessons learned
+Phased curriculum with delayed auxiliary loss introduction.
 
-This curriculum merges insights from multiple experiments:
-1. Delayed auxiliary losses (spectrum @ 15K, precursor @ 30K) for stable gradients
-2. Clean/noisy data mixing for smooth transitions (no curriculum shock)
-3. Progressive noise introduction (delayed peak dropout until 70K)
-4. Smooth loss weight ramping
+Based on gradient information analysis, this curriculum introduces:
+- Spectrum loss @ step 15k (55% accuracy, gradient strength 0.25)
+- Precursor loss @ step 30k (70% accuracy, gradient strength 0.59)
 
-Key Phases:
-- Phase 1 (0-15K): Pure CE, 100% clean - Build foundation (~55% accuracy)
-- Phase 2 (15K-30K): Add spectrum loss, 100% clean - Learn fragment physics clearly
-- Phase 3 (30K-70K): Add precursor + gradual mixing 80%→20% clean - Smooth noise intro
-- Phase 4 (70K-100K): Add dropout + full realism 10%→0% clean - Final robustness
+This provides clearer, more actionable gradients compared to early introduction.
 """
 
 from dataclasses import dataclass
@@ -33,27 +27,24 @@ class CurriculumStage:
     min_length: int = 7
     max_length: int = 20
 
-    # Noise parameters (for noisy examples only when clean_data_ratio < 1.0)
+    # Noise parameters
     noise_peaks: int = 0
     peak_dropout: float = 0.0
     mass_error_ppm: float = 0.0
     intensity_variation: float = 0.0
-
-    # Data mixing - probability of clean vs noisy data
-    clean_data_ratio: float = 1.0  # 1.0 = 100% clean, 0.0 = 100% noisy
 
     # Loss weights
     spectrum_loss_weight: float = 0.0
     precursor_loss_weight: float = 0.0
 
 
-# 10-stage curriculum: 100K steps total
-DEFAULT_CURRICULUM = [
+# Phased 10-stage curriculum with delayed auxiliary loss introduction
+PHASED_CURRICULUM = [
     # ========================================================================
-    # PHASE 1: FOUNDATION (0-15K) - Pure CE, Build Stable Representations
+    # PHASE 1: FOUNDATION (0-15k) - Pure CE, Build Stable Representations
     # ========================================================================
 
-    # Stage 1 (0-7.5K): Foundation - Learn basic token distributions
+    # Stage 1 (0-7.5k): Foundation - Learn basic token distributions
     CurriculumStage(
         name="stage_1_foundation",
         steps=7500,
@@ -62,147 +53,138 @@ DEFAULT_CURRICULUM = [
         noise_peaks=0,
         peak_dropout=0.0,
         mass_error_ppm=0.0,
-        clean_data_ratio=1.0,  # 100% clean
         spectrum_loss_weight=0.0,  # Pure CE
         precursor_loss_weight=0.0,
     ),
 
-    # Stage 2 (7.5K-15K): Stabilization - Let model reach ~55% accuracy
+    # Stage 2 (7.5k-15k): Stabilization - Let model reach ~55% accuracy
     CurriculumStage(
         name="stage_2_stabilization",
-        steps=7500,
+        steps=7500,  # 7.5k-15k
         min_length=7,
         max_length=10,
         noise_peaks=0,
         peak_dropout=0.0,
         mass_error_ppm=0.0,
-        clean_data_ratio=1.0,  # 100% clean
-        spectrum_loss_weight=0.0,  # Still pure CE - build foundation first
+        spectrum_loss_weight=0.0,  # Still pure CE
         precursor_loss_weight=0.0,
     ),
 
     # ========================================================================
-    # PHASE 2: FRAGMENT PHYSICS (15K-30K) - Introduce Spectrum Loss on Clean Data
+    # PHASE 2: FRAGMENT PHYSICS (15k-30k) - Introduce Spectrum Loss
     # ========================================================================
 
-    # Stage 3 (15K-22.5K): Spectrum introduction - Clean data for clear gradients
+    # Stage 3 (15k-22.5k): Spectrum introduction - Gentle start
     CurriculumStage(
         name="stage_3_spectrum_intro",
-        steps=7500,
+        steps=7500,  # 15k-22.5k
         min_length=7,
         max_length=11,
-        noise_peaks=0,  # NO noise yet - learn fragment patterns clearly
-        peak_dropout=0.0,
-        mass_error_ppm=0.0,
-        clean_data_ratio=1.0,  # 100% clean - CRITICAL for learning fragment physics
+        noise_peaks=1,  # Minimal noise
+        peak_dropout=0.02,
+        mass_error_ppm=2.0,
         spectrum_loss_weight=0.08,  # START: Gradient strength ~0.25 at 55% acc
         precursor_loss_weight=0.0,  # Not yet
     ),
 
-    # Stage 4 (22.5K-30K): Spectrum ramp-up - Still clean
+    # Stage 4 (22.5k-30k): Spectrum ramp-up
     CurriculumStage(
         name="stage_4_spectrum_ramp",
-        steps=7500,
+        steps=7500,  # 22.5k-30k
         min_length=7,
         max_length=12,
-        noise_peaks=0,  # Still clean
-        peak_dropout=0.0,
-        mass_error_ppm=0.0,
-        clean_data_ratio=1.0,  # 100% clean - stabilize spectrum learning
+        noise_peaks=2,
+        peak_dropout=0.05,
+        mass_error_ppm=5.0,
         spectrum_loss_weight=0.12,  # Increase: Model at ~65% acc
         precursor_loss_weight=0.0,
     ),
 
     # ========================================================================
-    # PHASE 3: MASS CONSTRAINT + GRADUAL MIXING (30K-70K)
+    # PHASE 3: TOTAL MASS CONSTRAINT (30k-45k) - Introduce Precursor Loss
     # ========================================================================
 
-    # Stage 5 (30K-40K): Precursor intro + Light mixing
+    # Stage 5 (30k-37.5k): Precursor introduction - Model at ~70% accuracy
     CurriculumStage(
-        name="stage_5_precursor_light_mix",
-        steps=10000,
+        name="stage_5_precursor_intro",
+        steps=7500,  # 30k-37.5k
         min_length=7,
         max_length=13,
-        noise_peaks=1,       # Minimal noise when sampled
-        peak_dropout=0.0,    # NO dropout yet
-        mass_error_ppm=1.0,  # Very light
-        clean_data_ratio=0.8,  # 80% clean, 20% noisy - smooth introduction
+        noise_peaks=3,
+        peak_dropout=0.08,
+        mass_error_ppm=7.5,
         spectrum_loss_weight=0.15,
         precursor_loss_weight=0.01,  # START: Gradient strength ~0.59 at 70% acc
     ),
 
-    # Stage 6 (40K-50K): Light noise mixing
+    # Stage 6 (37.5k-45k): Precursor ramp-up
     CurriculumStage(
-        name="stage_6_light_noise",
-        steps=10000,
+        name="stage_6_precursor_ramp",
+        steps=7500,  # 37.5k-45k
         min_length=7,
         max_length=14,
-        noise_peaks=2,
-        peak_dropout=0.0,    # STILL no dropout
-        mass_error_ppm=2.0,
-        clean_data_ratio=0.6,  # 60% clean, 40% noisy
+        noise_peaks=5,
+        peak_dropout=0.10,
+        mass_error_ppm=10.0,
         spectrum_loss_weight=0.18,
-        precursor_loss_weight=0.02,
+        precursor_loss_weight=0.02,  # Model at ~75% acc
     ),
 
-    # Stage 7 (50K-60K): Moderate noise mixing
+    # ========================================================================
+    # PHASE 4: FULL MULTI-TASK LEARNING (45k-100k) - All Losses Active
+    # ========================================================================
+
+    # Stage 7 (45k-55k): Moderate-high noise
     CurriculumStage(
-        name="stage_7_moderate_noise",
-        steps=10000,
+        name="stage_7_moderate_high",
+        steps=10000,  # 45k-55k
         min_length=7,
         max_length=15,
-        noise_peaks=3,
-        peak_dropout=0.0,    # STILL no dropout
-        mass_error_ppm=5.0,
-        clean_data_ratio=0.4,  # 40% clean, 60% noisy
+        noise_peaks=6,
+        peak_dropout=0.12,
+        mass_error_ppm=12.0,
         spectrum_loss_weight=0.20,
         precursor_loss_weight=0.03,
     ),
 
-    # Stage 8 (60K-70K): Heavy noise mixing
+    # Stage 8 (55k-67.5k): High noise
     CurriculumStage(
-        name="stage_8_heavy_noise",
-        steps=10000,
+        name="stage_8_high_noise",
+        steps=12500,  # 55k-67.5k
         min_length=7,
         max_length=16,
-        noise_peaks=5,
-        peak_dropout=0.0,    # STILL no dropout - delayed!
-        mass_error_ppm=8.0,
-        clean_data_ratio=0.2,  # 20% clean, 80% noisy
+        noise_peaks=7,
+        peak_dropout=0.13,
+        mass_error_ppm=13.0,
+        intensity_variation=0.1,
         spectrum_loss_weight=0.22,
         precursor_loss_weight=0.05,
     ),
 
-    # ========================================================================
-    # PHASE 4: FULL REALISM (70K-100K) - Add Dropout, Final Push
-    # ========================================================================
-
-    # Stage 9 (70K-85K): Near-realistic + Introduce dropout
+    # Stage 9 (67.5k-82.5k): Near-realistic
     CurriculumStage(
         name="stage_9_near_realistic",
-        steps=15000,
+        steps=15000,  # 67.5k-82.5k
         min_length=7,
-        max_length=18,
-        noise_peaks=7,
-        peak_dropout=0.08,   # FIRST TIME: Add dropout now that model is robust
-        mass_error_ppm=12.0,
-        intensity_variation=0.1,
-        clean_data_ratio=0.1,  # 10% clean, 90% noisy
+        max_length=17,
+        noise_peaks=8,
+        peak_dropout=0.14,
+        mass_error_ppm=14.0,
+        intensity_variation=0.15,
         spectrum_loss_weight=0.24,
         precursor_loss_weight=0.06,
     ),
 
-    # Stage 10 (85K-100K): Fully realistic
+    # Stage 10 (82.5k-100k): Fully realistic
     CurriculumStage(
         name="stage_10_realistic",
-        steps=15000,
+        steps=17500,  # 82.5k-100k
         min_length=7,
-        max_length=20,
+        max_length=18,
         noise_peaks=10,
-        peak_dropout=0.10,   # Realistic dropout
+        peak_dropout=0.15,
         mass_error_ppm=15.0,
         intensity_variation=0.2,
-        clean_data_ratio=0.0,  # 100% noisy - full realism
         spectrum_loss_weight=0.25,  # Final weight
         precursor_loss_weight=0.08,  # Final weight
     ),
@@ -222,7 +204,7 @@ class CurriculumScheduler:
         stages: list[CurriculumStage] = None,
         dataset: SyntheticPeptideDataset = None,
     ):
-        self.stages = stages or DEFAULT_CURRICULUM
+        self.stages = stages or PHASED_CURRICULUM
         self.dataset = dataset
         self.current_stage_idx = -1
         self._cumulative_steps = self._compute_cumulative_steps()
@@ -278,7 +260,6 @@ class CurriculumScheduler:
                     peak_dropout=stage.peak_dropout,
                     mass_error_ppm=stage.mass_error_ppm,
                     intensity_variation=stage.intensity_variation,
-                    clean_data_ratio=stage.clean_data_ratio,
                 )
 
             log.info(
@@ -286,7 +267,6 @@ class CurriculumScheduler:
                 f"Curriculum: Advanced to '{stage.name}' at step {global_step}\n"
                 f"{'='*60}\n"
                 f"  Peptide length: {stage.min_length}-{stage.max_length}\n"
-                f"  Clean data ratio: {stage.clean_data_ratio:.0%} clean, {(1-stage.clean_data_ratio):.0%} noisy\n"
                 f"  Noise peaks: {stage.noise_peaks}\n"
                 f"  Peak dropout: {stage.peak_dropout:.1%}\n"
                 f"  Mass error: {stage.mass_error_ppm} ppm\n"
