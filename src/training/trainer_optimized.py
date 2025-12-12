@@ -24,7 +24,7 @@ from tqdm import tqdm
 from ..model.trm import RecursivePeptideModel
 from .losses import DeepSupervisionLoss, CombinedLoss
 from .metrics import compute_metrics
-from .curriculum_extended import CurriculumScheduler, EXTENDED_CURRICULUM
+from .curriculum import CurriculumScheduler, DEFAULT_CURRICULUM
 from ..data.ion_types import get_ion_types_for_model
 from ..constants import PROTON_MASS
 

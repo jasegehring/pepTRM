@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 from src.model.trm import TRMConfig, create_model
 from src.data.ms2pip_dataset import MS2PIPSyntheticDataset
 from src.training.trainer_optimized import OptimizedTrainer, TrainingConfig
-from src.training.curriculum_extended import CurriculumScheduler, EXTENDED_CURRICULUM
+from src.training.curriculum import CurriculumScheduler, DEFAULT_CURRICULUM
 
 
 def main():
@@ -94,7 +94,7 @@ def main():
     print(f"  MS2PIP model: {cfg.data.ms2pip_model}")
 
     # Create curriculum scheduler
-    curriculum = CurriculumScheduler(EXTENDED_CURRICULUM, train_dataset)
+    curriculum = CurriculumScheduler(DEFAULT_CURRICULUM, train_dataset)
 
     # Custom collate function for MS2PIPSample dataclasses
     def collate_fn(batch):
