@@ -60,7 +60,10 @@ def generate_theoretical_spectrum(
     charge: int = 2,
     ion_types: list[str] = None,
     include_neutral_losses: bool = False,
-    noise_peaks: int = 0,
+    noise_peaks: int = 0,  # Legacy single-tier noise
+    noise_peaks_low: int = 0,  # Two-tier: low-intensity "grass" (0.0-0.1)
+    noise_peaks_high: int = 0,  # Two-tier: high-intensity "spikes" (0.2-1.0)
+    signal_suppression: float = 0.0,  # Prob of crushing real peak to <0.05
     peak_dropout: float = 0.0,
     mass_error_ppm: float = 0.0,
     intensity_variation: float = 0.0,
@@ -79,7 +82,10 @@ def generate_theoretical_spectrum(
         charge: Precursor charge state (affects m/z calculation)
         ion_types: Which ion series to generate ('b', 'y', 'a')
         include_neutral_losses: Include -H2O and -NH3 losses
-        noise_peaks: Number of random noise peaks to add (for realistic simulation)
+        noise_peaks: Number of random noise peaks to add (legacy single-tier)
+        noise_peaks_low: Two-tier noise - "grass" peaks (intensity 0.0-0.1)
+        noise_peaks_high: Two-tier noise - "spike" peaks (intensity 0.2-1.0)
+        signal_suppression: Probability of crushing real peak to noise level
         peak_dropout: Fraction of theoretical peaks to randomly remove
         mass_error_ppm: Add Gaussian mass error (parts per million)
         intensity_variation: Add variation to intensities
@@ -163,6 +169,14 @@ def generate_theoretical_spectrum(
     if peak_dropout > 0:
         peaks = [p for p in peaks if random.random() > peak_dropout]
 
+    # Apply signal suppression - crush random real peaks to noise level
+    # This decorrelates intensity from validity (real peaks can be weak)
+    if signal_suppression > 0:
+        peaks = [
+            (m, random.uniform(0.01, 0.05)) if random.random() < signal_suppression else (m, i)
+            for m, i in peaks
+        ]
+
     # Apply mass error
     if mass_error_ppm > 0:
         peaks = [
@@ -177,13 +191,30 @@ def generate_theoretical_spectrum(
             for m, i in peaks
         ]
 
-    # Add noise peaks
+    # Add noise peaks (legacy single-tier)
     if noise_peaks > 0:
         max_mass = precursor_mass
         for _ in range(noise_peaks):
             noise_mass = random.uniform(50, max_mass)
             noise_intensity = random.uniform(0.01, 0.2)
             peaks.append((noise_mass, noise_intensity))
+
+    # Two-tier noise: "Grass" (low-intensity chemical background)
+    if noise_peaks_low > 0:
+        max_mass = precursor_mass
+        for _ in range(noise_peaks_low):
+            grass_mass = random.uniform(50, max_mass)
+            grass_intensity = random.uniform(0.0, 0.1)  # Low intensity
+            peaks.append((grass_mass, grass_intensity))
+
+    # Two-tier noise: "Spikes" (high-intensity contaminants)
+    # These kill the "big = real" bias by adding decoy bright peaks
+    if noise_peaks_high > 0:
+        max_mass = precursor_mass
+        for _ in range(noise_peaks_high):
+            spike_mass = random.uniform(50, max_mass)
+            spike_intensity = random.uniform(0.2, 1.0)  # High intensity
+            peaks.append((spike_mass, spike_intensity))
 
     # Sort by mass
     peaks.sort(key=lambda x: x[0])

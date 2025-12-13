@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from ..model.trm import RecursivePeptideModel
 from .losses import DeepSupervisionLoss, CombinedLoss
-from .metrics import compute_metrics
+from .metrics import compute_metrics, compute_metrics_by_length
 from .curriculum import CurriculumScheduler, DEFAULT_CURRICULUM
 from .refinement_tracker import compute_refinement_metrics
 from ..data.ion_types import get_ion_types_for_model
@@ -305,12 +305,8 @@ class OptimizedTrainer:
                 precursor_charge=precursor_charge,
             )
 
-            # Update curriculum
-            if self.curriculum:
-                if self.curriculum.step(self.global_step):
-                    if self.use_combined_loss:
-                        self.loss_fn.spectrum_weight = self.curriculum.get_spectrum_loss_weight()
-                        self.loss_fn.precursor_weight = self.curriculum.get_precursor_loss_weight()
+            # NOTE: Curriculum is now updated in main training loop to allow
+            # DataLoader iterator recreation when stage changes
 
             # Compute loss
             if self.use_combined_loss:
@@ -378,7 +374,27 @@ class OptimizedTrainer:
                 )
                 metrics.update(refinement_metrics)
 
+                # Compute accuracy by length bucket (for debugging length generalization)
+                length_metrics = compute_metrics_by_length(
+                    logits=final_logits,
+                    targets=batch['sequence'],
+                    mask=batch['sequence_mask'],
+                )
+                metrics.update(length_metrics)
+
         return loss.item(), metrics
+
+    def _create_train_iterator(self):
+        """Create a fresh iterator over the training DataLoader.
+
+        This is necessary because when using num_workers > 0 with an IterableDataset,
+        the worker processes get their own copy of the dataset. When curriculum.step()
+        updates the dataset parameters, the workers don't see those changes.
+
+        By recreating the iterator when the curriculum stage changes, we force
+        new worker processes to be spawned with the updated parameters.
+        """
+        return iter(self.train_loader)
 
     def train(self):
         """Main training loop."""
@@ -396,130 +412,156 @@ class OptimizedTrainer:
 
         pbar = tqdm(total=self.config.max_steps, desc='Training')
 
-        while self.global_step < self.config.max_steps:
-            for batch in self.train_loader:
-                # Training step
-                loss, metrics = self.train_step(batch)
+        # Create initial iterator
+        train_iterator = self._create_train_iterator()
 
-                # Logging
-                if self.global_step % self.config.log_interval == 0:
-                    log_str = (
-                        f"Step {self.global_step} | "
-                        f"Loss: {loss:.4f} | "
-                        f"Token Acc: {metrics.get('token_accuracy', 0):.3f} | "
-                        f"Seq Acc: {metrics.get('sequence_accuracy', 0):.3f} | "
-                        f"LR: {self.scheduler.get_last_lr()[0]:.2e}"
+        while self.global_step < self.config.max_steps:
+            # Check curriculum and recreate iterator if stage changed
+            if self.curriculum:
+                stage_changed = self.curriculum.step(self.global_step)
+                if stage_changed:
+                    # Update loss weights
+                    if self.use_combined_loss:
+                        self.loss_fn.spectrum_weight = self.curriculum.get_spectrum_loss_weight()
+                        self.loss_fn.precursor_weight = self.curriculum.get_precursor_loss_weight()
+                    # CRITICAL: Recreate iterator so workers get updated dataset parameters
+                    train_iterator = self._create_train_iterator()
+                    tqdm.write(f"[Step {self.global_step}] Recreated DataLoader iterator for new curriculum stage")
+
+            # Get next batch
+            try:
+                batch = next(train_iterator)
+            except StopIteration:
+                # Iterator exhausted (shouldn't happen with IterableDataset, but handle it)
+                train_iterator = self._create_train_iterator()
+                batch = next(train_iterator)
+
+            # Training step
+            loss, metrics = self.train_step(batch)
+
+            # Logging
+            if self.global_step % self.config.log_interval == 0:
+                log_str = (
+                    f"Step {self.global_step} | "
+                    f"Loss: {loss:.4f} | "
+                    f"Token Acc: {metrics.get('token_accuracy', 0):.3f} | "
+                    f"Seq Acc: {metrics.get('sequence_accuracy', 0):.3f} | "
+                    f"LR: {self.scheduler.get_last_lr()[0]:.2e}"
+                )
+                tqdm.write(log_str)
+
+                if self.use_wandb:
+                    import wandb
+                    log_dict = {
+                        'train/loss': loss,
+                        'train/token_accuracy': metrics.get('token_accuracy', 0),
+                        'train/sequence_accuracy': metrics.get('sequence_accuracy', 0),
+                        'train/learning_rate': self.scheduler.get_last_lr()[0],
+                        'train/step': self.global_step,
+                    }
+                    # Add all other metrics - preserve recursion/ prefix for organization
+                    for k, v in metrics.items():
+                        if k not in ['token_accuracy', 'sequence_accuracy']:
+                            # Recursion metrics already have their prefix
+                            if k.startswith('recursion/'):
+                                log_dict[k] = v
+                            else:
+                                log_dict[f'train/{k}'] = v
+
+                    # Add curriculum stage info
+                    if self.curriculum and self.curriculum.current_stage:
+                        stage = self.curriculum.current_stage
+                        log_dict['curriculum/stage_idx'] = self.curriculum.current_stage_idx
+                        log_dict['curriculum/min_length'] = stage.min_length
+                        log_dict['curriculum/max_length'] = stage.max_length
+                        log_dict['curriculum/noise_peaks'] = stage.noise_peaks
+                        log_dict['curriculum/peak_dropout'] = stage.peak_dropout
+                        log_dict['curriculum/mass_error_ppm'] = stage.mass_error_ppm
+                        log_dict['curriculum/spectrum_loss_weight'] = stage.spectrum_loss_weight
+                        log_dict['curriculum/precursor_loss_weight'] = stage.precursor_loss_weight
+
+                    wandb.log(log_dict, step=self.global_step)
+
+            # Validation
+            if self.global_step % self.config.eval_interval == 0:
+                # Easy validation (clean data, short peptides)
+                if self.val_loader_easy is not None:
+                    val_easy_metrics = self.evaluate(self.val_loader_easy)
+                    tqdm.write(
+                        f"Val (Easy) | Token Acc: {val_easy_metrics['token_accuracy']:.3f} | "
+                        f"Seq Acc: {val_easy_metrics['sequence_accuracy']:.3f}"
                     )
-                    tqdm.write(log_str)
 
                     if self.use_wandb:
                         import wandb
-                        log_dict = {
-                            'train/loss': loss,
-                            'train/token_accuracy': metrics.get('token_accuracy', 0),
-                            'train/sequence_accuracy': metrics.get('sequence_accuracy', 0),
-                            'train/learning_rate': self.scheduler.get_last_lr()[0],
-                            'train/step': self.global_step,
-                        }
-                        # Add all other metrics
-                        for k, v in metrics.items():
-                            if k not in ['token_accuracy', 'sequence_accuracy']:
-                                log_dict[f'train/{k}'] = v
+                        wandb.log({
+                            f'val_easy/{k}': v for k, v in val_easy_metrics.items()
+                        }, step=self.global_step)
 
-                        # Add curriculum stage info
-                        if self.curriculum and self.curriculum.current_stage:
-                            stage = self.curriculum.current_stage
-                            log_dict['curriculum/stage_idx'] = self.curriculum.current_stage_idx
-                            log_dict['curriculum/min_length'] = stage.min_length
-                            log_dict['curriculum/max_length'] = stage.max_length
-                            log_dict['curriculum/noise_peaks'] = stage.noise_peaks
-                            log_dict['curriculum/peak_dropout'] = stage.peak_dropout
-                            log_dict['curriculum/mass_error_ppm'] = stage.mass_error_ppm
-                            log_dict['curriculum/spectrum_loss_weight'] = stage.spectrum_loss_weight
-                            log_dict['curriculum/precursor_loss_weight'] = stage.precursor_loss_weight
+                    # Save best model based on easy validation
+                    if val_easy_metrics['sequence_accuracy'] > self.best_val_acc:
+                        self.best_val_acc = val_easy_metrics['sequence_accuracy']
+                        self.save_checkpoint('best_model.pt')
 
-                        wandb.log(log_dict, step=self.global_step)
+                # Hard validation (realistic noise, longer peptides)
+                if self.val_loader_hard is not None:
+                    val_hard_metrics = self.evaluate(self.val_loader_hard)
+                    tqdm.write(
+                        f"Val (Hard) | Token Acc: {val_hard_metrics['token_accuracy']:.3f} | "
+                        f"Seq Acc: {val_hard_metrics['sequence_accuracy']:.3f}"
+                    )
 
-                # Validation (FIXED: was self.val_dataset, now self.val_loader_easy/hard)
-                if self.global_step % self.config.eval_interval == 0:
-                    # Easy validation (clean data, short peptides)
-                    if self.val_loader_easy is not None:
-                        val_easy_metrics = self.evaluate(self.val_loader_easy)
-                        tqdm.write(
-                            f"Val (Easy) | Token Acc: {val_easy_metrics['token_accuracy']:.3f} | "
-                            f"Seq Acc: {val_easy_metrics['sequence_accuracy']:.3f}"
-                        )
+                    if self.use_wandb:
+                        import wandb
+                        wandb.log({
+                            f'val_hard/{k}': v for k, v in val_hard_metrics.items()
+                        }, step=self.global_step)
 
-                        if self.use_wandb:
-                            import wandb
-                            wandb.log({
-                                f'val_easy/{k}': v for k, v in val_easy_metrics.items()
-                            }, step=self.global_step)
+            # Real data validation (less frequent)
+            if self.global_step % self.real_data_eval_interval == 0:
+                # ProteomeTools validation (synthetic peptide library)
+                if self.val_loader_proteometools is not None:
+                    pt_metrics = self.evaluate(
+                        self.val_loader_proteometools,
+                        num_batches=self.real_data_num_batches
+                    )
+                    tqdm.write(
+                        f"Val (ProteomeTools) | Token Acc: {pt_metrics['token_accuracy']:.3f} | "
+                        f"Seq Acc: {pt_metrics['sequence_accuracy']:.3f}"
+                    )
 
-                        # Save best model based on easy validation
-                        if val_easy_metrics['sequence_accuracy'] > self.best_val_acc:
-                            self.best_val_acc = val_easy_metrics['sequence_accuracy']
-                            self.save_checkpoint('best_model.pt')
+                    if self.use_wandb:
+                        import wandb
+                        wandb.log({
+                            f'val_proteometools/{k}': v for k, v in pt_metrics.items()
+                        }, step=self.global_step)
 
-                    # Hard validation (realistic noise, longer peptides)
-                    if self.val_loader_hard is not None:
-                        val_hard_metrics = self.evaluate(self.val_loader_hard)
-                        tqdm.write(
-                            f"Val (Hard) | Token Acc: {val_hard_metrics['token_accuracy']:.3f} | "
-                            f"Seq Acc: {val_hard_metrics['sequence_accuracy']:.3f}"
-                        )
+                # Nine-Species validation (real biological data)
+                if self.val_loader_nine_species is not None:
+                    ns_metrics = self.evaluate(
+                        self.val_loader_nine_species,
+                        num_batches=self.real_data_num_batches
+                    )
+                    tqdm.write(
+                        f"Val (Nine-Species) | Token Acc: {ns_metrics['token_accuracy']:.3f} | "
+                        f"Seq Acc: {ns_metrics['sequence_accuracy']:.3f}"
+                    )
 
-                        if self.use_wandb:
-                            import wandb
-                            wandb.log({
-                                f'val_hard/{k}': v for k, v in val_hard_metrics.items()
-                            }, step=self.global_step)
+                    if self.use_wandb:
+                        import wandb
+                        wandb.log({
+                            f'val_nine_species/{k}': v for k, v in ns_metrics.items()
+                        }, step=self.global_step)
 
-                # Real data validation (less frequent)
-                if self.global_step % self.real_data_eval_interval == 0:
-                    # ProteomeTools validation (synthetic peptide library)
-                    if self.val_loader_proteometools is not None:
-                        pt_metrics = self.evaluate(
-                            self.val_loader_proteometools,
-                            num_batches=self.real_data_num_batches
-                        )
-                        tqdm.write(
-                            f"Val (ProteomeTools) | Token Acc: {pt_metrics['token_accuracy']:.3f} | "
-                            f"Seq Acc: {pt_metrics['sequence_accuracy']:.3f}"
-                        )
+            # Checkpointing
+            if self.global_step % self.config.save_interval == 0 and self.global_step > 0:
+                self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
 
-                        if self.use_wandb:
-                            import wandb
-                            wandb.log({
-                                f'val_proteometools/{k}': v for k, v in pt_metrics.items()
-                            }, step=self.global_step)
+            self.global_step += 1
+            pbar.update(1)
 
-                    # Nine-Species validation (real biological data)
-                    if self.val_loader_nine_species is not None:
-                        ns_metrics = self.evaluate(
-                            self.val_loader_nine_species,
-                            num_batches=self.real_data_num_batches
-                        )
-                        tqdm.write(
-                            f"Val (Nine-Species) | Token Acc: {ns_metrics['token_accuracy']:.3f} | "
-                            f"Seq Acc: {ns_metrics['sequence_accuracy']:.3f}"
-                        )
-
-                        if self.use_wandb:
-                            import wandb
-                            wandb.log({
-                                f'val_nine_species/{k}': v for k, v in ns_metrics.items()
-                            }, step=self.global_step)
-
-                # Checkpointing
-                if self.global_step % self.config.save_interval == 0 and self.global_step > 0:
-                    self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
-
-                self.global_step += 1
-                pbar.update(1)
-
-                if self.global_step >= self.config.max_steps:
-                    break
+            if self.global_step >= self.config.max_steps:
+                break
 
         # Final checkpoint
         self.save_checkpoint('final_model.pt')

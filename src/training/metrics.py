@@ -147,3 +147,64 @@ def compute_metrics(
             metrics['mean_mass_error_ppm'] = sum(mass_errors) / len(mass_errors)
 
     return metrics
+
+
+def compute_metrics_by_length(
+    logits: Tensor,
+    targets: Tensor,
+    mask: Tensor,
+) -> dict:
+    """
+    Compute token accuracy broken down by sequence length buckets.
+
+    Returns:
+        dict with accuracy for each length bucket:
+        - 'length_7_12_acc': accuracy for lengths 7-12
+        - 'length_13_17_acc': accuracy for lengths 13-17
+        - 'length_18_25_acc': accuracy for lengths 18-25
+        - 'avg_length': average sequence length in batch
+    """
+    predictions = logits.argmax(dim=-1)
+
+    # Normalize I/L
+    predictions = normalize_il_ambiguity(predictions)
+    targets_norm = normalize_il_ambiguity(targets)
+
+    # Get sequence lengths
+    seq_lengths = mask.sum(dim=-1)  # (batch,)
+
+    # Initialize accumulators for each bucket
+    buckets = {
+        'short': {'correct': 0, 'total': 0},   # 7-12
+        'medium': {'correct': 0, 'total': 0},  # 13-17
+        'long': {'correct': 0, 'total': 0},    # 18-25
+    }
+
+    for i in range(len(predictions)):
+        seq_len = int(seq_lengths[i].item())
+        correct = ((predictions[i] == targets_norm[i]) & mask[i]).sum().item()
+        total = seq_len
+
+        if seq_len <= 12:
+            buckets['short']['correct'] += correct
+            buckets['short']['total'] += total
+        elif seq_len <= 17:
+            buckets['medium']['correct'] += correct
+            buckets['medium']['total'] += total
+        else:
+            buckets['long']['correct'] += correct
+            buckets['long']['total'] += total
+
+    metrics = {
+        'avg_length': seq_lengths.float().mean().item(),
+    }
+
+    # Only add bucket metrics if there are samples in that bucket
+    if buckets['short']['total'] > 0:
+        metrics['length_7_12_acc'] = buckets['short']['correct'] / buckets['short']['total']
+    if buckets['medium']['total'] > 0:
+        metrics['length_13_17_acc'] = buckets['medium']['correct'] / buckets['medium']['total']
+    if buckets['long']['total'] > 0:
+        metrics['length_18_25_acc'] = buckets['long']['correct'] / buckets['long']['total']
+
+    return metrics

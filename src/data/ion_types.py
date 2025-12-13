@@ -97,6 +97,7 @@ def compute_theoretical_peaks(
     sequence_probs: Tensor,
     aa_masses: Tensor,
     ion_type_names: List[str],
+    sequence_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """
     Compute theoretical fragment ion m/z values from sequence probabilities.
@@ -108,6 +109,7 @@ def compute_theoretical_peaks(
         sequence_probs: (batch, seq_len, vocab_size) - probability distribution over sequences
         aa_masses: (vocab_size,) - mass of each amino acid token
         ion_type_names: List of ion type names to compute (e.g., ['b', 'y', 'b++', 'y++'])
+        sequence_mask: (batch, seq_len) - optional mask indicating valid positions (True/1 = valid)
 
     Returns:
         theoretical_peaks: (batch, num_fragments) - m/z values of theoretical fragments
@@ -115,7 +117,7 @@ def compute_theoretical_peaks(
     Example:
         >>> # For HCDch2 model
         >>> ion_types = get_ion_types_for_model('HCDch2')
-        >>> peaks = compute_theoretical_peaks(probs, masses, ion_types)
+        >>> peaks = compute_theoretical_peaks(probs, masses, ion_types, mask)
         >>> # Returns b, y, b++, y++ ions
     """
     batch_size, seq_len, vocab_size = sequence_probs.shape
@@ -123,6 +125,11 @@ def compute_theoretical_peaks(
     # Compute expected mass at each position (soft embedding approach)
     # This allows gradients to flow through sequence probabilities
     expected_masses = torch.einsum('bsv,v->bs', sequence_probs, aa_masses)
+
+    # Zero out PAD positions using mask (if provided)
+    # This prevents padding tokens from contributing to fragment mass calculations
+    if sequence_mask is not None:
+        expected_masses = expected_masses * sequence_mask.float()
 
     # Remove <SOS> and <EOS> tokens to get residue masses
     # Assuming first and last positions are SOS/EOS

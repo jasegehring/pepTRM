@@ -250,6 +250,30 @@ class NineSpeciesDataset(Dataset):
 
         return samples
 
+    def _strip_modifications(self, peptide: str) -> str:
+        """
+        Strip modification annotations from peptide sequence.
+
+        Common patterns in Nine-Species:
+        - M+15.995 = Oxidized methionine
+        - C+57.021 = Carbamidomethyl cysteine
+        - Q+0.984, N+0.984 = Deamidation
+        - -17.027Q = Pyroglutamate (N-term)
+        - +43.006 = N-term acetyl/carbamyl
+
+        Returns the base amino acid sequence.
+        """
+        # Remove N-terminal modifications (start with + or -)
+        if peptide and peptide[0] in '+-':
+            match = re.match(r'^[+-][\d.]+', peptide)
+            if match:
+                peptide = peptide[match.end():]
+
+        # Remove inline modifications (AA+delta or AA-delta)
+        base_seq = re.sub(r'[+-][\d.]+', '', peptide)
+
+        return base_seq
+
     def _process_spectrum(
         self,
         spectrum: Dict,
@@ -259,12 +283,20 @@ class NineSpeciesDataset(Dataset):
         Process a single spectrum into a training sample.
 
         Returns None if spectrum should be filtered out.
+
+        Note: Modified peptides are currently STRIPPED to their base sequence.
+        This creates a mass mismatch (spectrum has modified fragment masses,
+        but we use unmodified theoretical masses). This is a known limitation.
         """
         # Check if peptide annotation exists
         if 'peptide' not in spectrum:
             return None
 
-        peptide = spectrum['peptide'].upper()
+        raw_peptide = spectrum['peptide'].upper()
+
+        # Strip modifications to get base sequence
+        # WARNING: This creates mass mismatches for modified peptides
+        peptide = self._strip_modifications(raw_peptide)
 
         # Filter by length
         if len(peptide) < self.min_length or len(peptide) > self.max_length:

@@ -1,0 +1,216 @@
+Here is the complete implementation strategy to integrate the Mass Gap token and Residual Spectrum Embedding.
+
+This strategy transforms your model from a standard sequencer into a "physics-aware solver" that can insert wildcards to explain spectral data.
+
+1. New Physics Component: Handling the [GAP] Token
+We need an updated physics engine that calculates masses based on both the token identity and a predicted scalar mass shift.
+
+Python
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from ..constants import PAD_IDX
+
+def compute_theoretical_masses_with_gap(
+    sequence_ids: torch.Tensor,      # (Batch, SeqLen) - Predicted token indices
+    predicted_deltas: torch.Tensor,  # (Batch, SeqLen) - Predicted mass shifts (float)
+    aa_mass_tensor: torch.Tensor,    # (Vocab,) - Standard mass lookup
+    gap_idx: int,                    # Index of [GAP] token
+    ion_types: list = ['b', 'y']
+) -> torch.Tensor:
+    """
+    Compute theoretical fragment masses. 
+    If token is [GAP], uses predicted_delta as mass.
+    If token is standard AA, uses AA mass + predicted_delta (allows for PTMs).
+    """
+    # 1. Get Base Masses from Lookup Table
+    # (Batch, SeqLen)
+    base_masses = F.embedding(sequence_ids, aa_mass_tensor) 
+
+    # 2. Determine Final Mass per Position
+    # Logic: Final Mass = Base_Mass + Predicted_Delta
+    # For [GAP] token, Base_Mass is 0.0, so it relies entirely on Delta.
+    # For 'A' token, it becomes Mass(A) + Delta (e.g., Acetylation)
+    final_pos_masses = base_masses + predicted_deltas
+
+    # 3. Masking (Zero out padding)
+    mask = (sequence_ids != PAD_IDX).float()
+    masked_masses = final_pos_masses * mask
+    
+    # 4. Compute Ion Series (Prefix/Suffix Sums)
+    theoretical_peaks = []
+    
+    if 'b' in ion_types:
+        # b-ions: Sum from Left (N-term)
+        b_ions = torch.cumsum(masked_masses, dim=1)
+        theoretical_peaks.append(b_ions)
+        
+    if 'y' in ion_types:
+        # y-ions: Sum from Right (C-term)
+        y_ions = torch.flip(torch.cumsum(torch.flip(masked_masses, [1]), dim=1), [1])
+        theoretical_peaks.append(y_ions)
+        
+    # Stack and flatten: (Batch, Num_Ion_Types * SeqLen)
+    all_masses = torch.cat(theoretical_peaks, dim=1)
+    
+    return all_masses
+2. New Encoder Component: Residual Spectrum Eye
+This module renders the "Residual" (Difference between Reality and Expectation) and uses a CNN to find "Shift Patterns."
+
+Python
+
+class ResidualSpectrumEncoder(nn.Module):
+    def __init__(self, 
+                 max_mz=2000.0, 
+                 bin_size=0.5,     # 0.5 Da bins (4000 total) - Coarse but fast
+                 embed_dim=256):
+        super().__init__()
+        
+        self.max_mz = max_mz
+        self.bin_size = bin_size
+        self.num_bins = int(max_mz / bin_size) + 1
+        
+        # 3-Layer CNN to detect "Shift Patterns"
+        self.cnn = nn.Sequential(
+            # Layer 1: Detect Peaks (Local 0.5 Da features)
+            nn.Conv1d(1, 32, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(32),
+            nn.LeakyReLU(0.1),
+            
+            # Layer 2: Detect Envelopes (Medium 1.5 Da features)
+            nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(0.1),
+            
+            # Layer 3: Detect Global Shifts (Wide ~4 Da features)
+            nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.1),
+            
+            nn.Flatten(),
+        )
+        
+        # Dynamic shape calculation
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, self.num_bins)
+            out_dim = self.cnn(dummy).shape[1]
+            
+        self.projector = nn.Linear(out_dim, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def _render(self, masses, intensities=None):
+        """Fast scatter-add rendering (Non-differentiable / Detached)"""
+        B = masses.shape[0]
+        device = masses.device
+        
+        # Hard Binning
+        indices = (masses / self.bin_size).long().clamp(0, self.num_bins - 1)
+        spectrum = torch.zeros(B, self.num_bins, device=device)
+        
+        src = intensities if intensities is not None else torch.ones_like(masses)
+        spectrum.scatter_add_(1, indices, src)
+        
+        return spectrum.unsqueeze(1) # Add channel dim
+
+    def forward(self, observed_masses, observed_intensities, theoretical_masses):
+        # 1. Render Reality
+        obs_spec = self._render(observed_masses, observed_intensities)
+        
+        # 2. Render Expectation
+        theo_spec = self._render(theoretical_masses)
+        
+        # 3. Compute Residual
+        # Positive values = Unexplained Peaks
+        # Negative values = Hallucinated Peaks
+        residual = obs_spec - theo_spec
+        
+        # 4. Encode Pattern
+        features = self.cnn(residual)
+        embedding = self.norm(self.projector(features))
+        
+        return embedding
+3. Updated Model Architecture: TRMWithMassGap
+This wires everything together. The key addition is the delta_mass_head and the feedback loop.
+
+Python
+
+class TRMWithMassGap(nn.Module):
+    def __init__(self, vocab_size, d_model, aa_masses, gap_idx, ...):
+        super().__init__()
+        # ... standard inits ...
+        
+        self.aa_masses = aa_masses # Tensor buffer
+        self.gap_idx = gap_idx
+        
+        # 1. The Physics Eye
+        self.residual_encoder = ResidualSpectrumEncoder(embed_dim=d_model)
+        
+        # 2. The Mass Gap Head (Regression)
+        # Predicts mass shift scalar for every position
+        self.delta_mass_head = nn.Linear(d_model, 1)
+        
+        # 3. The Sequence Head (Classification)
+        self.token_head = nn.Linear(d_model, vocab_size)
+
+    def forward(self, observed_masses, observed_intensities, steps=8):
+        
+        batch_size = observed_masses.shape[0]
+        
+        # Initial Guess (Empty or Start Token)
+        current_tokens = torch.full((batch_size, self.seq_len), PAD_IDX, device=observed_masses.device)
+        current_deltas = torch.zeros((batch_size, self.seq_len), device=observed_masses.device)
+        
+        # Latent state (z)
+        z = self.init_latent(batch_size) 
+        
+        all_logits = []
+        all_deltas = []
+
+        for t in range(steps):
+            
+            # --- A. PHYSICS FEEDBACK LOOP ---
+            # 1. Compute theoretical peaks based on CURRENT guess
+            with torch.no_grad(): # Don't backprop through the "eye"
+                theo_masses = compute_theoretical_masses_with_gap(
+                    current_tokens, 
+                    current_deltas,
+                    self.aa_masses,
+                    self.gap_idx
+                )
+            
+            # 2. See the Error
+            residual_emb = self.residual_encoder(
+                observed_masses, 
+                observed_intensities, 
+                theo_masses
+            ) 
+            
+            # --- B. RECURSIVE UPDATE ---
+            
+            # Inject Error Signal into Latent State
+            # This forces the model to attend to what it missed
+            z_input = z + residual_emb.unsqueeze(1) 
+            
+            # Run Decoder Block
+            x_out, z_new = self.decoder_block(z_input, ...)
+            z = z_new 
+            
+            # --- C. DUAL PREDICTION ---
+            
+            # 1. Predict Identity (Is it 'A', 'K', or '[GAP]'?)
+            logits = self.token_head(x_out) 
+            
+            # 2. Predict Mass (If [GAP], what is the mass?)
+            # Tanh * 500 bounds the prediction between -500 Da and +500 Da
+            deltas = torch.tanh(self.delta_mass_head(x_out)).squeeze(-1) * 500.0
+            
+            all_logits.append(logits)
+            all_deltas.append(deltas)
+            
+            # --- D. UPDATE STATE ---
+            # Use predictions for the next physics check
+            current_tokens = logits.argmax(dim=-1)
+            current_deltas = deltas.detach() # Detach for next input
+            
+        return torch.stack(all_logits), torch.stack(all_deltas)one m[q

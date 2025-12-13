@@ -1,12 +1,20 @@
-# RecursivePeptide: TRM for De Novo Peptide Sequencing
+# PepTRM: Recursive Transformer for De Novo Peptide Sequencing
+**Status**: Active Development | **Latest**: Aggressive noise training in progress
+**Last Updated**: December 12, 2024
+
+---
 
 ## Project Overview
 
-**Goal**: Implement a Tiny Recursive Model (TRM) for de novo peptide sequencing from mass spectrometry (MS/MS) data.
+**Goal**: Implement a Tiny Recursive Model (TRM) for de novo peptide sequencing from mass spectrometry (MS/MS) data, capable of handling noisy real-world spectra through iterative refinement.
 
 **Core Insight**: Unlike standard autoregressive models that generate sequences in a single pass, this model uses a recursive loop to iteratively refine predictions. Mass spectrometry provides hard physical constraints (fragment masses must match observed peaks), making this domain uniquely suited for iterative refinement—the model can learn to "check its work" against mass constraints and self-correct.
 
-**Key Innovation**: We add a mass-matching auxiliary loss that exploits the physical constraints of mass spectrometry—something not present in TRM's original puzzle-solving domains (Sudoku, ARC-AGI, Mazes).
+**Key Innovations**:
+1. **Physics-aware losses**: Spectrum matching + precursor mass constraints
+2. **Iterative refinement**: 8 supervision steps with 6 latent reasoning steps each
+3. **Curriculum learning**: Progressive noise introduction for robustness
+4. **Real data integration**: Seamless synthetic → real data transition
 
 **Reference**: "Less is More: Recursive Reasoning with Tiny Networks" (Jolicoeur-Martineau, 2025)
 
@@ -17,50 +25,181 @@
 ### Core TRM Loop
 
 ```
-For each supervision step t ∈ {1, ..., T}:
-    For n latent reasoning steps:
-        z = f_θ(x, y, z)           # Update latent state ("think")
-    y = g_θ(y, z)                  # Update sequence prediction ("act")
-    Loss_t = CE(y, target) + λ * SpectrumMatch(y, x)
+Initialize: y₀ (sequence logits), z₀ (latent state)
 
-Total Loss = Σ_t w_t * Loss_t     # Deep supervision with weighted sum
+For each supervision step t ∈ {1, ..., 8}:
+    For n=6 latent reasoning steps:
+        z = LayerNorm(z + TransformerBlock(z, spectrum_encoding))  # Think
+
+    y = OutputHead(z)  # Act
+
+    Loss_t = CrossEntropy(y, target) + λ_precursor * PrecursorLoss(y, precursor_mass)
+
+Total Loss = Σ_t w_t * Loss_t     # Deep supervision with exponential weighting
 ```
 
 **Key Components**:
-- **x** (Input): MS/MS spectrum (peaks with m/z + intensities) + precursor mass/charge
-- **y** (Hypothesis): Predicted amino acid sequence (probability distribution)
-- **z** (Latent State): Hidden "scratchpad" for reasoning
-- **T**: Number of supervision steps (default: 8)
-- **n**: Number of latent steps per supervision (default: 4)
+- **Spectrum Encoding** (x): MS/MS peaks (m/z + intensities) encoded via Transformer
+- **Sequence Hypothesis** (y): Predicted amino acid sequence (logits over vocabulary)
+- **Latent State** (z): Hidden "scratchpad" for multi-step reasoning
+- **Supervision Steps**: 8 (allows 8 attempts to refine prediction)
+- **Latent Steps**: 6 per supervision (gives model time to "think")
 
-### Model Structure
+### Model Architecture
 
-1. **Spectrum Encoder**: Transformer that encodes peak embeddings (mass + intensity)
-2. **Recursive Decoder**: Shared weights used at every step for refinement
-3. **Deep Supervision**: Loss computed at ALL steps, not just final output
+```
+Input Spectrum (100 peaks × 2 features)
+    ↓
+┌─────────────────────────────────┐
+│  Spectrum Encoder               │
+│  - Peak Embeddings (mass + int) │
+│  - 3-layer Transformer          │
+│  - 6 attention heads            │
+│  Hidden dim: 384                │
+└─────────────────────────────────┘
+    ↓ (encoded spectrum)
+┌─────────────────────────────────┐
+│  Recursive Decoder Core         │
+│  - Shared weights (reused 8×)   │
+│  - 3-layer Transformer          │
+│  - Cross-attention to spectrum  │
+│  - Soft embeddings from probs   │
+│  - Residual connections         │
+└─────────────────────────────────┘
+    ↓ (8 refinement iterations)
+┌─────────────────────────────────┐
+│  Deep Supervision               │
+│  - CE loss at ALL 8 steps       │
+│  - Exponential weighting        │
+│  - Precursor mass constraint    │
+└─────────────────────────────────┘
+    ↓
+Output: Refined sequence prediction
+```
 
-### Critical Design Decisions
+**Model Size**: 12.5M parameters
+**Training Speed**: ~4.4 it/s with torch.compile (RTX 4090)
 
-**Deep Supervision** (Core TRM Innovation):
-- Compute loss at every supervision step, not just the end
-- Forces model to learn a trajectory of improvement
-- Uses weighted sum (linear weighting by default: later steps weighted more)
+---
 
-**Soft Embeddings**:
-- Convert probability distributions → embeddings via learned projection
-- Enables gradient flow through recursive loop
-- Different from hard argmax decoding
+## Current Status (December 2024)
 
-**EMA (Critical for Stability)**:
-- Exponential moving average of parameters (decay=0.999)
-- Used for validation and final predictions
+### ✅ **Achievements**
+
+**Infrastructure**:
+- ✅ torch.compile working (2.1x speedup with batch_size=80)
+- ✅ Mixed precision training (bfloat16)
+- ✅ Gradient accumulation for memory efficiency
+- ✅ EMA for training stability
+- ✅ W&B integration for experiment tracking
+
+**Data Pipeline**:
+- ✅ MS2PIP synthetic data (infinite, configurable noise)
+- ✅ ProteomeTools dataset loader (21M high-quality synthetic spectra)
+- ✅ Nine-Species dataset loader (2.8M real PSMs from 9 species)
+- ✅ Identical interface for all datasets (easy switching)
+- ✅ Curriculum learning with dynamic noise adjustment
+
+**Model Performance**:
+- ✅ **91.3% token accuracy** on clean synthetic data
+- ✅ **58% sequence accuracy** on clean data
+- ✅ Physics tests: 100% passing
+- ✅ Training stable with EMA
+
+### 🔄 **In Progress**
+
+**Active Training Run** (Aggressive Noise Curriculum):
+- Testing hypothesis: "Does noise unlock multi-step refinement?"
+- Exponential iteration weighting (force step 7 optimization)
+- Clean/noisy mixing: 80% clean → 0% clean over 45K steps
+- Precursor loss: 0.05 → 0.3 over training
+- **Goal**: See refinement across ALL 8 steps, not just step 0→1
+
+### ❌ **Known Challenges**
+
+1. **Recursion Plateau** 🔴 **HIGH PRIORITY**
+   - Model refines step 0→1 (loss: 0.98 → 0.83) ✅
+   - But plateaus steps 2-7 (all ~0.82 loss) ❌
+   - Only using ~2 of 8 available refinement steps
+   - **Current hypothesis**: Linear weighting insufficient, noise too gentle
+
+2. **Spectrum Loss Challenges**
+   - Stuck at 94-96% with sigma=0.2 Da (only 4-6% coverage)
+   - Root cause: Sigma too narrow for current model accuracy
+   - With 9% token errors → 50-200 Da fragment mass errors
+   - **Solution**: Disabled for now, testing precursor loss only
+
+3. **Sim-to-Real Gap** (Unknown)
+   - Haven't tested on real data yet
+   - Expect lower accuracy (60-75%) on Nine-Species benchmark
+
+---
+
+## Key Design Decisions
+
+### **1. Deep Supervision with Exponential Weighting**
+
+**Why**: Force model to optimize ALL refinement steps, not just early ones
+
+**Iteration Weights**:
+- Linear (old): [2.8%, 5.6%, 8.3%, ..., 22%] → step 7 only gets 22% of gradient
+- **Exponential (new)**: [0.4%, 0.8%, 1.6%, ..., 50%] → step 7 gets 50% of gradient
+
+**Impact**: Should unlock multi-step refinement
+
+### **2. Curriculum Learning (Clean/Noisy Mixing)**
+
+**Philosophy**: Start with mostly clean data, gradually increase noise proportion
+
+**Schedule**:
+```
+Stage 1 (0-10K):   80% clean, 20% noisy → Learn basics
+Stage 2 (10K-20K): 60% clean, 40% noisy → More challenge
+Stage 3 (20K-30K): 40% clean, 60% noisy → Majority noisy
+Stage 4 (30K-45K): 20% clean, 80% noisy → Force robustness
+Stage 5 (45K+):     0% clean, 100% noisy → Pure realistic data
+```
+
+**Noise Profile** (Real-world MS/MS):
+- 5-30 random noise peaks
+- 15-45% peak dropout (missing fragments)
+- 5-20 ppm mass error
+- 20-70% intensity variation
+
+### **3. Physics-Based Losses**
+
+**Precursor Mass Loss** (Enabled):
+```python
+# Normalize mass error by average AA mass (110 Da)
+# Balances gradient magnitudes with CrossEntropy loss
+predicted_mass = Σ P(aa_i) * mass(aa_i) + H2O_mass
+error_da = predicted_mass - observed_precursor_mass
+loss = SmoothL1(error_da / 110.0)  # Normalized to "AA units"
+```
+
+**Spectrum Matching Loss** (Disabled for now):
+- Current: Gaussian kernel with sigma=0.2 Da
+- Problem: Too narrow for 9% token error rate
+- Future: Adaptive sigma curriculum (10 Da → 0.5 Da)
+- Alternative: Matched filter loss (recall-only, robust to dropout)
+
+### **4. EMA (Exponential Moving Average)**
+
+**Critical for stability**:
+- Decay: 0.999
+- Always use EMA model for validation/inference
 - TRM paper reports instability without EMA
 
-**Mass-Matching Auxiliary Loss** (Domain-Specific):
-- Computes expected theoretical fragment masses from soft predictions
-- Differentiable: E[mass_i] = Σ P(aa) * mass(aa)
-- Matches theoretical peaks to observed peaks via soft assignment
-- Guides model toward physically plausible sequences
+### **5. Soft Embeddings**
+
+**Enable gradient flow through recursive loop**:
+```python
+# Convert probability distribution to continuous embedding
+probs = softmax(logits)  # (batch, seq_len, vocab_size)
+soft_embedding = learned_projection(probs)  # Differentiable
+```
+
+**Why**: Allows model to receive gradient signal about "almost correct" predictions
 
 ---
 
@@ -68,253 +207,363 @@ Total Loss = Σ_t w_t * Loss_t     # Deep supervision with weighted sum
 
 ### Physical Constraints
 
-**Peptide Mass Calculation**:
+**Peptide Mass**:
 ```
-Peptide mass = Σ(residue masses) + H2O
+Precursor mass = Σ(amino acid masses) + H2O_mass
 ```
 
-**Fragment Ion Types**:
-- **b-ions**: N-terminal fragments (mass = sum from N-terminus)
-- **y-ions**: C-terminal fragments (mass = sum from C-terminus + H2O)
-- Both provide constraints on valid sequences
+**Fragment Ions**:
+- **b-ions**: N-terminal fragments (mass = cumsum from left)
+- **y-ions**: C-terminal fragments (mass = cumsum from right + H2O)
+- **b++, y++**: Doubly-charged fragments (common in charge 2+ precursors)
+  - Formula: (neutral_mass + 2 × proton_mass) / 2
+  - **Status**: Not yet implemented (critical missing physics)
 
-**Key Physics**:
-- All masses are monoisotopic (from UniProt reference)
-- Water mass = 18.01056 Da
-- Proton mass = 1.00727 Da
-- Fragment masses must match observed peaks within tolerance (~0.5 Da or 20 ppm)
+**Key Constants** (from UniProt):
+- Water mass: 18.01056 Da
+- Proton mass: 1.00727 Da
+- Average AA mass: ~110 Da
+
+**Tolerances**:
+- High-resolution MS: 5-20 ppm (0.01-0.04 Da at m/z 2000)
+- Low-resolution MS: 50-100 ppm
 
 ### Isobaric Ambiguities
 
 **Unresolvable by mass alone**:
-- I/L (Isoleucine/Leucine): Identical mass (113.08406 Da)
-- K/Q (Lysine/Glutamine): Very similar mass (Δ = 0.036 Da)
+- **I/L** (Isoleucine/Leucine): Identical mass (113.08406 Da)
+- **K/Q** (Lysine/Glutamine): Very similar (Δ = 0.036 Da, within instrument tolerance)
 
-These require additional context or cannot be distinguished.
-
-### Curriculum Learning Rationale
-
-Progressive difficulty helps model learn refinement behavior:
-
-**Stage 1 - Clean** (0-10K steps):
-- Short peptides (7-10 AA)
-- Perfect spectra (no noise, no dropout)
-- Learn basic mass-to-sequence mapping
-
-**Stage 2 - Moderate** (10K-25K steps):
-- Medium length (7-15 AA)
-- 10% peak dropout, 5 noise peaks
-- Learn to handle missing information
-
-**Stage 3 - Realistic** (25K-50K steps):
-- Full length (7-20 AA)
-- 20% dropout, 10 noise peaks, 20 ppm mass error
-- Matches real MS/MS conditions
+**Current handling**: Model must learn from context (future: uncertainty quantification)
 
 ---
 
 ## Development Guidelines
 
-### Running Tests
+### Quick Start
 
-**Critical: Physics tests must pass 100%**
+**1. Install Dependencies**:
+```bash
+pip install torch wandb omegaconf ms2pip
+```
+
+**2. Run Physics Tests** (Must pass 100%):
 ```bash
 pytest tests/test_physics.py -v
 ```
-All mass calculations validated against UniProt reference values.
 
-**All tests**:
+**3. Quick Validation** (Overfit test):
 ```bash
-pytest tests/ -v
+python scripts/overfit_test.py
 ```
+Target: >80% token accuracy after 500 steps on 1 batch
 
-### Training
-
-**Quick validation** (overfit test):
+**4. Full Training**:
 ```bash
-python3 scripts/overfit_test.py
-```
-Target: Loss < 0.3, Token accuracy > 80% after 500 steps
+# Current aggressive noise run
+python scripts/train_aggressive_noise.py
 
-**Full training** (with curriculum):
-```bash
-python3 scripts/train_ms2pip.py
+# Or standard optimized training
+python scripts/train_optimized.py
 ```
-100K steps, extended curriculum, automatic difficulty progression
 
 ### Configuration
 
-Edit `configs/optimized_extended.yaml` to customize:
-- Model size (hidden_dim, num_layers, num_heads)
-- Training (batch_size, learning_rate)
-- Curriculum stages
-- MS2PIP settings (ms2pip_model, top_k_peaks)
-- EMA settings (critical: keep enabled!)
+**Main config**: `configs/aggressive_noise_test.yaml`
+
+```yaml
+model:
+  hidden_dim: 384
+  num_encoder_layers: 3
+  num_decoder_layers: 3
+  num_heads: 6
+  num_supervision_steps: 8
+  num_latent_steps: 6
+
+training:
+  batch_size: 80
+  learning_rate: 1.5e-4
+  use_amp: true
+  use_compile: true
+  iteration_weights: 'exponential'  # Force late-step optimization
+  spectrum_weight: 0.0  # Disabled (sigma too narrow)
+
+  # Curriculum
+  use_curriculum: true
+```
 
 ### Key Files
 
 **Core Implementation**:
-- `src/constants.py`: Amino acid masses, vocabulary (CRITICAL - physics foundation)
-- `src/data/ms2pip_dataset.py`: MS2PIP-based data generation
-- `src/model/decoder.py`: Recursive core (TRM innovation)
-- `src/training/losses.py`: Deep supervision + spectrum matching
+```
+src/
+├── constants.py              # Amino acid masses (physics foundation)
+├── data/
+│   ├── ms2pip_dataset.py    # MS2PIP synthetic data
+│   ├── proteometools_dataset.py  # High-quality synthetic
+│   └── nine_species_dataset.py   # Real biological data
+├── model/
+│   ├── encoder.py           # Spectrum encoder
+│   ├── decoder.py           # Recursive core (TRM innovation)
+│   └── trm.py              # Full model
+└── training/
+    ├── losses.py            # Deep supervision + physics losses
+    ├── trainer_optimized.py # Optimized trainer (compile, AMP, etc.)
+    └── curriculum_aggressive_noise.py  # Current curriculum
+```
 
 **Entry Points**:
-- `scripts/train_ms2pip.py`: Main training script
-- `scripts/overfit_test.py`: Validation
-- `configs/optimized_extended.yaml`: Optimized configuration
+```
+scripts/
+├── train_aggressive_noise.py  # Current experiment
+├── train_optimized.py         # Standard optimized training
+└── overfit_test.py           # Validation test
+```
+
+**Documentation**:
+```
+docs/
+├── MASTER_ROADMAP_2024-12-12.md  # Complete development plan
+├── README_DOCUMENTATION.md        # Documentation index
+├── training_with_real_data.md    # Real data guide
+├── proteometools_dataset.md      # ProteomeTools setup
+└── nine_species_dataset.md       # Nine-Species benchmark
+```
 
 ---
 
-## Current Status
+## Roadmap & Future Work
 
-### ✅ Implemented (MVP Complete)
+**See `docs/MASTER_ROADMAP_2024-12-12.md` for complete details.**
 
-**Data Pipeline**:
-- MS2PIP-based realistic spectrum generator
-- Sinusoidal mass embeddings
-- Infinite dataset with curriculum support
+### **Phase 1: Unlock Multi-Step Recursion** (Weeks 1-2) 🔴 **CURRENT**
 
-**Model Architecture**:
-- Spectrum encoder (Transformer, 2 layers, 4 heads)
-- Recursive decoder with shared weights
-- ~945K parameters (MVP config)
-- Tested and working
+**Goal**: Prove model can use all 8 refinement steps
 
-**Training System**:
-- Deep supervision loss (linear weighting)
-- Spectrum matching auxiliary loss
-- 3-stage curriculum learning
-- EMA for stability
-- Full trainer with logging
+**In Progress**:
+- ⏳ Aggressive noise training (exponential weighting + noise curriculum)
+- ⏳ Monitor per-step losses: Does ce_step_7 < ce_step_0?
 
-**Validation**:
-- Physics tests: 18/18 passing (100%)
-- Overfit test: 86.2% token accuracy, 62.5% sequence accuracy
-- Model successfully learns
+**If Current Run Fails**:
+- 🔲 Implement step embeddings (tell model which iteration it's on)
+- 🔲 Fix residual format for answer_step (learn deltas, not states)
+- 🔲 Integrate refinement tracker (monitor sequence changes per step)
 
-### 🔄 In Progress
+### **Phase 2: Advanced Architecture Features** (Weeks 3-4)
 
-- Full training run (50K steps with curriculum)
-- Performance benchmarking on clean vs. noisy synthetic data
+**Mass Gap Token** (for unknown modifications):
+- Add `[GAP]` token to vocabulary
+- Predict mass shift per position: delta_mass_head(z) → ±500 Da
+- Compute fragment masses: base_mass + predicted_delta
+- **Use case**: PTMs, non-standard AAs, open search
 
-### 📋 Roadmap (Post-MVP)
+**Residual Spectrum Embedding** (physics feedback):
+- Render observed vs predicted spectra
+- Compute residual: what did we miss?
+- Feed through CNN to detect "shift patterns"
+- Inject into latent state for refinement
+- **Use case**: Modified peptides, mass shift detection
 
-**Near-term**:
-- Ablation studies (T=1 vs T=8, with/without spectrum loss)
-- Beam search inference
-- Uncertainty quantification (entropy thresholds)
+### **Phase 3: Spectrum Loss Improvements** (Week 5)
 
-**Medium-term**:
-- PTM support (phosphorylation, oxidation, etc.)
-- Real data pipeline (pyteomics integration)
-- Extended peptide lengths (25-30 AA)
+**Matched Filter Loss** (recall-only, robust to dropout):
+- Trust observed peaks (they're real)
+- Don't trust absence (peaks may have dropped out)
+- Let precursor loss handle precision (prevent hallucinations)
 
-**Long-term**:
-- Nine-Species benchmark evaluation
-- Comparison with Casanovo baseline
-- I/L ambiguity notation
-- Attention visualization
+**Adaptive Sigma Curriculum**:
+- Start wide: 10 Da (forgiving, learn rough patterns)
+- Narrow over time: 10 → 5 → 2 → 0.5 Da
+- Match sigma to model accuracy
+
+### **Phase 4: Real Data Transition** (Weeks 6-8) ⭐
+
+**Mixed Synthetic/Real Curriculum** (Recommended):
+```
+100% synthetic → 80/20 → 50/50 → 20/80 → 100% real
+Over 60-80K steps
+```
+
+**Benchmarks**:
+- 🔲 ProteomeTools pre-training (21M spectra, synthetic)
+- 🔲 Nine-Species 9-fold CV (2.8M PSMs, real data)
+- 🔲 Compare vs Casanovo baseline
+
+**Expected Performance**:
+- ProteomeTools: 85-90% token accuracy
+- Nine-Species: 60-75% token accuracy (real data is harder)
+
+### **Phase 5: Missing Physics & Advanced Features** (Weeks 9-12)
+
+**Critical Missing Physics**:
+- 🔲 Doubly-charged ions (b++, y++) - common in real data
+- 🔲 Common PTMs (oxidation, phosphorylation, acetylation)
+
+**Production Features**:
+- 🔲 Uncertainty quantification (entropy-based confidence)
+- 🔲 Beam search inference
+- 🔲 I/L ambiguity notation
 
 ---
 
 ## Performance Targets
 
-### Synthetic Data (Clean)
-- Token accuracy: >85%
-- Sequence accuracy: >60%
-- Mass error: <10 ppm
+### **Synthetic Data**
 
-### Synthetic Data (Realistic)
-- Token accuracy: >70%
-- Sequence accuracy: >40%
+| Dataset | Token Acc | Sequence Acc | Notes |
+|---------|-----------|--------------|-------|
+| MS2PIP (clean) | **>90%** | **>60%** | Current: 91.3% / 58% ✅ |
+| MS2PIP (noisy) | >75% | >30% | 45% dropout, 30 noise peaks |
+| ProteomeTools | >85% | >50% | High-quality synthetic |
 
-### Ablation Expectations
-- **Recursion benefit**: T=8 should beat T=1 by 10-15%
-- **Spectrum loss benefit**: Should add 5-10% improvement
-- **Curriculum benefit**: Faster convergence vs. fixed difficulty
+### **Real Data**
+
+| Dataset | Token Acc | Sequence Acc | Notes |
+|---------|-----------|--------------|-------|
+| Nine-Species | >70% | >30% | Averaged across 9 folds |
+| Nine-Species (easy) | >80% | >50% | Clean subset |
+
+### **Ablation Studies** (Planned)
+
+| Configuration | Expected Impact |
+|---------------|-----------------|
+| T=8 vs T=1 | Recursion adds +10-15% accuracy |
+| With vs without spectrum loss | +5-10% (when sigma is right) |
+| With vs without curriculum | Faster convergence, better final accuracy |
+| Exponential vs linear weighting | Unlocks multi-step refinement |
 
 ---
 
 ## Important Constraints & Notes
 
-### Physics Validation
-- **All mass calculations must be validated** against known reference values
+### **Physics Validation**
+- **All mass calculations must be validated** against UniProt reference values
 - Tests in `tests/test_physics.py` are non-negotiable
 - Wrong masses = meaningless results
 
-### I/L Ambiguity
-- Isoleucine and Leucine have identical mass
-- Model cannot distinguish them without additional context
-- Should be explicitly noted in uncertainty quantification
-
-### EMA is Critical
-- Training unstable without EMA
-- Use decay=0.999 (validated in TRM paper)
+### **EMA is Critical**
+- Training unstable without EMA (from TRM paper)
+- Use decay=0.999
 - Always use EMA model for validation/inference
 
-### Spectrum Loss Gradients
-- Must use soft embeddings (not hard argmax)
-- Expected mass: E[m] = Σ P(aa) * mass(aa)
-- Enables gradient flow through probability distributions
+### **Recursion Debugging**
+When recursion isn't working:
+1. Check iteration weighting (exponential > linear)
+2. Verify noise is challenging enough (easy data → no need to refine)
+3. Monitor per-step losses (should see gradient: step_0 > step_7)
+4. Check refinement tracker (edit_rate per step)
 
-### Curriculum Progression
+### **Curriculum is Essential**
 - Don't skip curriculum stages
-- Model needs easy examples first to learn refinement behavior
-- Jumping straight to hard examples leads to poor convergence
+- Model needs easy examples first
+- Catastrophic forgetting happens with distribution shifts (0 noise → 5 noise peaks)
+- Use gradual transitions (0 → 1 → 2 → 5 noise peaks)
+
+### **I/L Ambiguity**
+- Isoleucine and Leucine are **indistinguishable** by mass alone
+- Model should learn to output one consistently (or indicate uncertainty)
+- Future: Explicit uncertainty quantification
+
+---
+
+## Monitoring & Debugging
+
+### **Key W&B Metrics**
+
+**Per-step losses** (recursion diagnostics):
+```python
+ce_step_0: 0.98  # Initial rough guess
+ce_step_1: 0.83  # First refinement (working! ✅)
+ce_step_2: 0.82  # Plateau starts (problem ❌)
+ce_step_7: 0.82  # Should be << ce_step_0 if recursion works
+```
+
+**Refinement tracker** (when integrated):
+```python
+edit_rate_step_{t}:      # % of tokens changed at step t
+accuracy_step_{t}:       # % correct at step t
+improvement_step_{t}:    # Net improvement from edits
+```
+
+**Loss breakdown**:
+```python
+train/ce_loss:          # Cross-entropy
+train/precursor_loss:   # Precursor mass constraint
+train/spectrum_loss:    # Spectrum matching (disabled for now)
+```
+
+### **Common Issues**
+
+**"Model not refining past step 1"**:
+- ✅ Switch to exponential weighting
+- ✅ Increase noise difficulty (force model to need recursion)
+- 🔲 Add step embeddings (tell model which iteration it's on)
+- 🔲 Fix residual format (learn deltas, not states)
+
+**"Spectrum loss stuck at 95%"**:
+- ✅ Disable for now (sigma too narrow)
+- 🔲 Implement adaptive sigma curriculum
+- 🔲 Try matched filter loss (recall-only)
+
+**"Poor accuracy on real data"**:
+- 🔲 Pre-train on ProteomeTools first
+- 🔲 Use mixed synthetic/real curriculum
+- 🔲 Add doubly-charged ions (critical missing physics)
+- 🔲 Fine-tune with lower learning rate
 
 ---
 
 ## Code Quality Standards
 
-### When Making Changes
+### **When Making Changes**
 
 1. **Run physics tests first**: `pytest tests/test_physics.py -v`
-2. **Update tests** if changing mass calculations or spectrum generation
-3. **Document domain-specific logic** (e.g., why certain loss functions, why EMA)
-4. **Maintain type hints** throughout codebase
-5. **Test on overfit scenario** before full training
+2. **Test on overfit scenario**: Can it memorize 1 batch?
+3. **Update tests** if changing mass calculations or data generation
+4. **Document domain-specific logic** (why EMA, why certain losses)
+5. **Maintain type hints** throughout codebase
 
-### Architecture Principles
+### **Architecture Principles**
 
 - **Modularity**: Each component (encoder, decoder, losses) is independent
 - **Configuration-driven**: No hardcoded hyperparameters
-- **Physics-first**: Always validate against ground truth physics
-- **Deep supervision**: Never remove loss computation from intermediate steps
+- **Physics-first**: Always validate against ground truth
+- **Deep supervision**: Loss at ALL intermediate steps
+- **Curriculum learning**: Progressive difficulty essential
 
 ---
 
-## Getting Help
+## Resources
 
-### Common Issues
+### **Documentation**
+- **MASTER_ROADMAP_2024-12-12.md**: Complete development plan with priorities
+- **README_DOCUMENTATION.md**: Documentation index
+- **training_with_real_data.md**: Real data pipeline guide
+- **memory_management.md**: GPU optimization strategies
 
-**"Model not learning"**:
-1. Run overfit test first - can it memorize 1 batch?
-2. Check physics tests pass
-3. Verify EMA is enabled
-4. Check gradient clipping is active
+### **Papers**
+- TRM: Jolicoeur-Martineau et al., 2025
+- ProteomeTools: Gessulat et al., Nature Methods, 2019
+- Nine-Species: Eloff et al., Scientific Data, 2024
 
-**"Loss exploding"**:
-1. Ensure gradient clipping (max_norm=1.0)
-2. Verify EMA is enabled
-3. Reduce learning rate
-4. Check for NaN in mass calculations
-
-**"Poor accuracy on realistic data"**:
-1. Did you use curriculum learning?
-2. Is model overfitting clean data?
-3. Check spectrum loss weight is appropriate
-4. May need more training steps
-
-### Resources
-
-- TRM Paper: Jolicoeur-Martineau et al., 2025
-- README.md: Usage instructions and quick start
-- IMPLEMENTATION.md: Detailed implementation notes
-- Tests: See `tests/` for examples of correct behavior
+### **Datasets**
+- MS2PIP: On-the-fly synthetic (unlimited)
+- ProteomeTools: 21M synthetic spectra (2.3 GB download)
+- Nine-Species: 2.8M real PSMs (15-50 GB download)
 
 ---
 
 ## License
 
 MIT - See LICENSE file
+
+---
+
+**Quick Links**:
+- 📊 [Master Roadmap](docs/MASTER_ROADMAP_2024-12-12.md)
+- 📚 [Documentation Index](docs/README_DOCUMENTATION.md)
+- 🔬 [Training Guide](docs/training_with_real_data.md)
+- ⚙️ [Memory Optimization](docs/memory_management.md)
+
+**Status**: Active development, aggressive noise training in progress
+**Next Milestone**: Unlock multi-step recursion (Phases 1-2)

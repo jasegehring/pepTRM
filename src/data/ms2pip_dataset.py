@@ -57,7 +57,10 @@ class MS2PIPSyntheticDataset(IterableDataset):
         max_seq_len: int = 35,
         charge_distribution: dict = {2: 0.7, 3: 0.3},
         # Curriculum noise parameters
-        noise_peaks: int = 0,
+        noise_peaks: int = 0,  # Legacy: single-tier noise (for backwards compat)
+        noise_peaks_low: int = 0,  # Two-tier: low-intensity "grass" (0.0-0.1)
+        noise_peaks_high: int = 0,  # Two-tier: high-intensity "spikes" (0.2-1.0)
+        signal_suppression: float = 0.0,  # Prob of crushing real peak to <0.05
         peak_dropout: float = 0.0,
         mass_error_ppm: float = 0.0,
         intensity_variation: float = 0.0,
@@ -86,10 +89,14 @@ class MS2PIPSyntheticDataset(IterableDataset):
         self.charge_distribution = charge_distribution
 
         # Curriculum noise
-        self.noise_peaks = noise_peaks
+        self.noise_peaks = noise_peaks  # Legacy single-tier
+        self.noise_peaks_low = noise_peaks_low  # Two-tier: grass
+        self.noise_peaks_high = noise_peaks_high  # Two-tier: spikes
+        self.signal_suppression = signal_suppression
         self.peak_dropout = peak_dropout
         self.mass_error_ppm = mass_error_ppm
         self.intensity_variation = intensity_variation
+        self.clean_data_ratio = 1.0  # Start with 100% clean data
 
         # MS2PIP config
         self.ms2pip_model = ms2pip_model
@@ -116,10 +123,14 @@ class MS2PIPSyntheticDataset(IterableDataset):
         self,
         min_length: Optional[int] = None,
         max_length: Optional[int] = None,
-        noise_peaks: Optional[int] = None,
+        noise_peaks: Optional[int] = None,  # Legacy single-tier
+        noise_peaks_low: Optional[int] = None,  # Two-tier: grass
+        noise_peaks_high: Optional[int] = None,  # Two-tier: spikes
+        signal_suppression: Optional[float] = None,
         peak_dropout: Optional[float] = None,
         mass_error_ppm: Optional[float] = None,
         intensity_variation: Optional[float] = None,
+        clean_data_ratio: Optional[float] = None,
     ):
         """Update difficulty parameters for curriculum learning."""
         if min_length is not None:
@@ -128,12 +139,20 @@ class MS2PIPSyntheticDataset(IterableDataset):
             self.max_length = max_length
         if noise_peaks is not None:
             self.noise_peaks = noise_peaks
+        if noise_peaks_low is not None:
+            self.noise_peaks_low = noise_peaks_low
+        if noise_peaks_high is not None:
+            self.noise_peaks_high = noise_peaks_high
+        if signal_suppression is not None:
+            self.signal_suppression = signal_suppression
         if peak_dropout is not None:
             self.peak_dropout = peak_dropout
         if mass_error_ppm is not None:
             self.mass_error_ppm = mass_error_ppm
         if intensity_variation is not None:
             self.intensity_variation = intensity_variation
+        if clean_data_ratio is not None:
+            self.clean_data_ratio = clean_data_ratio
 
     def _sample_peptide(self) -> str:
         """Sample a random peptide sequence."""
@@ -192,33 +211,76 @@ class MS2PIPSyntheticDataset(IterableDataset):
 
         This simulates real-world instrument noise while keeping
         MS2PIP's realistic base intensities.
+
+        Uses clean_data_ratio to mix clean and noisy samples:
+        - clean_data_ratio=1.0: Always return clean data
+        - clean_data_ratio=0.5: 50% clean, 50% noisy
+        - clean_data_ratio=0.0: Always apply noise
+
+        Two-tier noise model (sim-to-real bridge):
+        - noise_peaks_low: "Grass" - chemical background (intensity 0.0-0.1)
+        - noise_peaks_high: "Spikes" - contaminants (intensity 0.2-1.0)
+        - signal_suppression: Crush real peaks to simulate ion suppression
         """
+        # Check if we should apply noise to this sample
+        if np.random.rand() < self.clean_data_ratio:
+            # Return clean data (no noise)
+            return masses, intensities
+
+        # Apply noise to this sample
         # 1. Peak dropout (missing fragments)
         if self.peak_dropout > 0:
             keep_mask = np.random.rand(len(masses)) > self.peak_dropout
             masses = masses[keep_mask]
             intensities = intensities[keep_mask]
 
-        # 2. Mass error
+        # 2. Signal suppression - crush random real peaks to noise level
+        # This decorrelates intensity from validity (real peaks can be weak)
+        if self.signal_suppression > 0 and len(intensities) > 0:
+            suppress_mask = np.random.rand(len(intensities)) < self.signal_suppression
+            # Crush suppressed peaks to very low intensity (0.01-0.05)
+            intensities[suppress_mask] = np.random.uniform(0.01, 0.05, suppress_mask.sum())
+
+        # 3. Mass error
         if self.mass_error_ppm > 0:
             mass_errors = np.random.normal(0, self.mass_error_ppm / 1e6, len(masses))
             masses = masses * (1 + mass_errors)
 
-        # 3. Intensity variation
+        # 4. Intensity variation
         if self.intensity_variation > 0:
             intensity_noise = np.random.normal(0, self.intensity_variation, len(intensities))
             intensities = np.clip(intensities + intensity_noise, 0, 1)
 
-        # 4. Add noise peaks
+        # 5. Add noise peaks (legacy single-tier)
         if self.noise_peaks > 0:
-            # Sample noise peaks from precursor mass range
             max_mass = masses.max() if len(masses) > 0 else 2000.0
             noise_masses = np.random.uniform(50, max_mass, self.noise_peaks)
             noise_intensities = np.random.exponential(0.1, self.noise_peaks)
-            noise_intensities = np.clip(noise_intensities, 0, 0.5)  # Noise peaks are weaker
+            noise_intensities = np.clip(noise_intensities, 0, 0.5)
 
             masses = np.concatenate([masses, noise_masses])
             intensities = np.concatenate([intensities, noise_intensities])
+
+        # 6. Two-tier noise: "Grass" (low-intensity background)
+        if self.noise_peaks_low > 0:
+            max_mass = masses.max() if len(masses) > 0 else 2000.0
+            grass_masses = np.random.uniform(50, max_mass, self.noise_peaks_low)
+            # Low intensity: uniform 0.0-0.1 (chemical background noise)
+            grass_intensities = np.random.uniform(0.0, 0.1, self.noise_peaks_low)
+
+            masses = np.concatenate([masses, grass_masses])
+            intensities = np.concatenate([intensities, grass_intensities])
+
+        # 7. Two-tier noise: "Spikes" (high-intensity contaminants)
+        # These kill the "big = real" bias by adding decoy bright peaks
+        if self.noise_peaks_high > 0:
+            max_mass = masses.max() if len(masses) > 0 else 2000.0
+            spike_masses = np.random.uniform(50, max_mass, self.noise_peaks_high)
+            # High intensity: uniform 0.2-1.0 (contaminants, co-eluting peptides)
+            spike_intensities = np.random.uniform(0.2, 1.0, self.noise_peaks_high)
+
+            masses = np.concatenate([masses, spike_masses])
+            intensities = np.concatenate([intensities, spike_intensities])
 
         return masses, intensities
 

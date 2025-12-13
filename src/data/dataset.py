@@ -47,7 +47,10 @@ class SyntheticPeptideDataset(IterableDataset):
 
         # Difficulty parameters (for curriculum learning)
         # These parameters only apply to NOISY examples
-        noise_peaks: int = 0,
+        noise_peaks: int = 0,  # Legacy single-tier noise
+        noise_peaks_low: int = 0,  # Two-tier: low-intensity "grass" (0.0-0.1)
+        noise_peaks_high: int = 0,  # Two-tier: high-intensity "spikes" (0.2-1.0)
+        signal_suppression: float = 0.0,  # Prob of crushing real peak to <0.05
         peak_dropout: float = 0.0,
         mass_error_ppm: float = 0.0,
         intensity_variation: float = 0.0,
@@ -66,7 +69,10 @@ class SyntheticPeptideDataset(IterableDataset):
         self.include_neutral_losses = include_neutral_losses
 
         # Difficulty parameters (only for noisy samples)
-        self.noise_peaks = noise_peaks
+        self.noise_peaks = noise_peaks  # Legacy single-tier
+        self.noise_peaks_low = noise_peaks_low  # Two-tier: grass
+        self.noise_peaks_high = noise_peaks_high  # Two-tier: spikes
+        self.signal_suppression = signal_suppression
         self.peak_dropout = peak_dropout
         self.mass_error_ppm = mass_error_ppm
         self.intensity_variation = intensity_variation
@@ -81,7 +87,10 @@ class SyntheticPeptideDataset(IterableDataset):
         self,
         min_length: Optional[int] = None,
         max_length: Optional[int] = None,
-        noise_peaks: Optional[int] = None,
+        noise_peaks: Optional[int] = None,  # Legacy single-tier
+        noise_peaks_low: Optional[int] = None,  # Two-tier: grass
+        noise_peaks_high: Optional[int] = None,  # Two-tier: spikes
+        signal_suppression: Optional[float] = None,
         peak_dropout: Optional[float] = None,
         mass_error_ppm: Optional[float] = None,
         intensity_variation: Optional[float] = None,
@@ -94,6 +103,12 @@ class SyntheticPeptideDataset(IterableDataset):
             self.max_length = max_length
         if noise_peaks is not None:
             self.noise_peaks = noise_peaks
+        if noise_peaks_low is not None:
+            self.noise_peaks_low = noise_peaks_low
+        if noise_peaks_high is not None:
+            self.noise_peaks_high = noise_peaks_high
+        if signal_suppression is not None:
+            self.signal_suppression = signal_suppression
         if peak_dropout is not None:
             self.peak_dropout = peak_dropout
         if mass_error_ppm is not None:
@@ -126,6 +141,9 @@ class SyntheticPeptideDataset(IterableDataset):
             ion_types=self.ion_types,
             include_neutral_losses=self.include_neutral_losses,
             noise_peaks=0 if use_clean else self.noise_peaks,
+            noise_peaks_low=0 if use_clean else self.noise_peaks_low,
+            noise_peaks_high=0 if use_clean else self.noise_peaks_high,
+            signal_suppression=0.0 if use_clean else self.signal_suppression,
             peak_dropout=0.0 if use_clean else self.peak_dropout,
             mass_error_ppm=0.0 if use_clean else self.mass_error_ppm,
             intensity_variation=0.0 if use_clean else self.intensity_variation,

@@ -12,11 +12,15 @@ def compute_refinement_metrics(
     """
     Compute how predictions change and improve across refinement steps.
 
-    Returns:
-        metrics: Dict with:
-            - edit_rate_step_{t}: % of tokens that changed from step t-1 to t
-            - accuracy_step_{t}: % of tokens correct at step t
-            - improvement_step_{t}: % of changed tokens that moved toward ground truth
+    Returns metrics with 'recursion/' prefix for WandB organization:
+        - recursion/accuracy_step_{t}: % of tokens correct at step t
+        - recursion/edit_rate_step_{t}: % of tokens that changed from step t-1 to t
+        - recursion/edit_quality_step_{t}: Net quality of edits (positive = helpful)
+
+    Summary metrics:
+        - recursion/accuracy_gain: accuracy_final - accuracy_step_0 (recursion benefit)
+        - recursion/total_edits: Total edit rate across all steps
+        - recursion/converged_by_step: First step where edit rate < 1%
     """
     num_steps = all_logits.shape[0]
     batch_size, seq_len = targets.shape
@@ -29,20 +33,31 @@ def compute_refinement_metrics(
         preds = all_logits[t].argmax(dim=-1)  # (B, S)
         all_preds.append(preds)
 
+    accuracies = []
+    edit_rates = []
+    converged_step = num_steps  # Default: never converged
+
     # Track changes and improvements
     for t in range(num_steps):
         # Accuracy at this step
         correct = (all_preds[t] == targets) & target_mask.bool()
         accuracy = correct.float().sum() / target_mask.sum()
-        metrics[f'accuracy_step_{t}'] = accuracy.item()
+        accuracies.append(accuracy.item())
+        metrics[f'recursion/accuracy_step_{t}'] = accuracy.item()
 
         if t > 0:
             # Edit rate: how many positions changed from previous step
             changed = (all_preds[t] != all_preds[t-1]) & target_mask.bool()
             edit_rate = changed.float().sum() / target_mask.sum()
-            metrics[f'edit_rate_step_{t}'] = edit_rate.item()
+            edit_rates.append(edit_rate.item())
+            metrics[f'recursion/edit_rate_step_{t}'] = edit_rate.item()
 
-            # Improvement rate: of the changed positions, how many got better?
+            # Check for convergence (edit rate < 1%)
+            if edit_rate.item() < 0.01 and converged_step == num_steps:
+                converged_step = t
+
+            # Edit quality: of the changes made, what's the net effect?
+            # Positive = edits are helpful, Negative = edits are harmful
             if changed.any():
                 # Was wrong at t-1, now correct at t
                 was_wrong = (all_preds[t-1] != targets) & target_mask.bool()
@@ -58,13 +73,15 @@ def compute_refinement_metrics(
                 num_regressed = regressed.float().sum()
                 num_changed = changed.float().sum()
 
-                # Net improvement: (improved - regressed) / changed
-                improvement_rate = (num_improved - num_regressed) / num_changed
-                metrics[f'improvement_step_{t}'] = improvement_rate.item()
+                # Net edit quality: (improved - regressed) / changed
+                # Range: [-1, 1], where 1 = all edits helpful, -1 = all edits harmful
+                edit_quality = (num_improved - num_regressed) / num_changed
+                metrics[f'recursion/edit_quality_step_{t}'] = edit_quality.item()
 
-                # Also track separately
-                metrics[f'improved_step_{t}'] = (num_improved / num_changed).item()
-                metrics[f'regressed_step_{t}'] = (num_regressed / num_changed).item()
+    # Summary metrics - these tell the overall recursion story
+    metrics['recursion/accuracy_gain'] = accuracies[-1] - accuracies[0]  # Key: recursion benefit
+    metrics['recursion/total_edits'] = sum(edit_rates)  # Total editing activity
+    metrics['recursion/converged_by_step'] = converged_step  # When predictions stabilized
 
     return metrics
 
@@ -75,23 +92,30 @@ def summarize_refinement(metrics: Dict[str, float], num_steps: int = 8) -> str:
 
     Example output:
         Step 0: 85.2% acc
-        Step 1: 92.3% acc | 15.2% edited | +85.3% improved
-        Step 2: 93.1% acc |  3.1% edited | +62.1% improved
+        Step 1: 92.3% acc | 15.2% edited | +85.3% quality
+        Step 2: 93.1% acc |  3.1% edited | +62.1% quality
         ...
+        Summary: +8.1% accuracy gain, converged at step 5
     """
     lines = []
     lines.append("Refinement Progress:")
 
     for t in range(num_steps):
-        acc = metrics.get(f'accuracy_step_{t}', 0.0) * 100
+        # Support both old and new key formats
+        acc = metrics.get(f'recursion/accuracy_step_{t}', metrics.get(f'accuracy_step_{t}', 0.0)) * 100
         line = f"  Step {t}: {acc:5.1f}% acc"
 
         if t > 0:
-            edit = metrics.get(f'edit_rate_step_{t}', 0.0) * 100
-            impr = metrics.get(f'improvement_step_{t}', 0.0) * 100
-            line += f" | {edit:5.1f}% edited | {impr:+6.1f}% net improvement"
+            edit = metrics.get(f'recursion/edit_rate_step_{t}', metrics.get(f'edit_rate_step_{t}', 0.0)) * 100
+            quality = metrics.get(f'recursion/edit_quality_step_{t}', metrics.get(f'improvement_step_{t}', 0.0)) * 100
+            line += f" | {edit:5.1f}% edited | {quality:+6.1f}% quality"
 
         lines.append(line)
+
+    # Add summary line
+    acc_gain = metrics.get('recursion/accuracy_gain', 0.0) * 100
+    converged = metrics.get('recursion/converged_by_step', num_steps)
+    lines.append(f"  Summary: {acc_gain:+.1f}% accuracy gain, converged at step {converged}")
 
     return '\n'.join(lines)
 
