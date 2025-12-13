@@ -474,11 +474,18 @@ class OptimizedTrainer:
                         log_dict['curriculum/stage_idx'] = self.curriculum.current_stage_idx
                         log_dict['curriculum/min_length'] = stage.min_length
                         log_dict['curriculum/max_length'] = stage.max_length
-                        log_dict['curriculum/noise_peaks'] = stage.noise_peaks
                         log_dict['curriculum/peak_dropout'] = stage.peak_dropout
                         log_dict['curriculum/mass_error_ppm'] = stage.mass_error_ppm
+                        log_dict['curriculum/clean_data_ratio'] = getattr(stage, 'clean_data_ratio', 1.0)
                         log_dict['curriculum/spectrum_loss_weight'] = stage.spectrum_loss_weight
                         log_dict['curriculum/precursor_loss_weight'] = stage.precursor_loss_weight
+                        # Handle both old (noise_peaks) and new (noise_peaks_low/high) curricula
+                        if hasattr(stage, 'noise_peaks_low'):
+                            log_dict['curriculum/noise_peaks_low'] = stage.noise_peaks_low
+                            log_dict['curriculum/noise_peaks_high'] = stage.noise_peaks_high
+                            log_dict['curriculum/signal_suppression'] = getattr(stage, 'signal_suppression', 0.0)
+                        else:
+                            log_dict['curriculum/noise_peaks'] = stage.noise_peaks
 
                     wandb.log(log_dict, step=self.global_step)
 
