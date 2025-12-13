@@ -1,0 +1,51 @@
+class PrecursorMassLoss(nn.Module):
+    """
+    Penalizes mass error in units of 'Amino Acids'.
+    
+    Why this works: 
+    - CrossEntropy penalizes a wrong token with ~2.0-5.0 loss.
+    - If we normalize mass error by ~110 Da (avg AA mass), a 1-AA error
+      also results in ~1.0 loss.
+    - This keeps gradients perfectly balanced without magic weights.
+    """
+    def __init__(self):
+        super().__init__()
+        self.avg_aa_mass = 110.0
+        
+        aa_masses = torch.tensor([AMINO_ACID_MASSES.get(aa, 0.0) for aa in VOCAB])
+        self.register_buffer('aa_masses', aa_masses)
+
+    def forward(
+        self,
+        sequence_probs: Tensor,    # (batch, seq_len, vocab)
+        precursor_mass: Tensor,    # (batch,)
+        sequence_mask: Tensor,     # (batch, seq_len)
+    ) -> Tuple[Tensor, Dict[str, float]]:
+        
+        # Expected mass: (batch, seq_len)
+        expected_masses = torch.einsum('bsv,v->bs', sequence_probs, self.aa_masses)
+
+        # Sum valid positions
+        predicted_peptide_mass = (expected_masses * sequence_mask.float()).sum(dim=1)
+        predicted_total = predicted_peptide_mass + WATER_MASS
+
+        # Error in Daltons
+        error_da = predicted_total - precursor_mass
+        
+        # Normalize to "Amino Acid Units"
+        # We use Smooth L1 (Huber) to handle outliers gracefully
+        # beta=0.1 means errors < 11 Da are quadratic (smooth), > 11 Da are linear (stable)
+        loss = F.smooth_l1_loss(
+            error_da / self.avg_aa_mass, 
+            torch.zeros_like(error_da),
+            beta=0.1,
+            reduction='mean'
+        )
+
+        metrics = {
+            'mass_error_da': error_da.abs().mean().item(),
+            'ppm_error': (error_da.abs() / precursor_mass * 1e6).mean().item(),
+            'precursor_loss': loss.item()
+        }
+
+        return loss, metrics

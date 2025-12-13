@@ -1,13 +1,15 @@
 """
-Optimized training entry point for high-performance GPUs (RTX 4090, A100).
+Aggressive noise training with exponential iteration weighting.
 
 Features:
-- Mixed precision training (AMP) - 2-3x speedup
-- torch.compile() - 1.2-1.5x speedup
-- Extended curriculum (100K steps, 10 stages)
-- Larger batch size (192 vs 64)
+- Aggressive noise curriculum (force recursion from start)
+- Exponential iteration weighting (optimize final steps)
+- Precursor loss enabled (ramping 0.05 → 0.3)
+- Spectrum loss DISABLED (sigma too narrow)
+- Mixed precision + torch.compile
+- Batch size 80 (confirmed working with compile)
 
-Expected training time: ~2.5 hours for 100K steps (vs ~7 hours without optimizations)
+Philosophy: Test if noise alone unlocks multi-step refinement.
 """
 
 import sys
@@ -22,16 +24,21 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-from src.model.trm import TRMConfig, create_model
+from src.model.trm import TRMConfig, RecursivePeptideModel
 from src.data.ms2pip_dataset import MS2PIPSyntheticDataset
 from src.data.proteometools_dataset import ProteomeToolsDataset
 from src.data.nine_species_dataset import NineSpeciesDataset
 from src.training.trainer_optimized import OptimizedTrainer, TrainingConfig
-from src.training.curriculum_delayed_spectrum import CurriculumScheduler, DELAYED_SPECTRUM_CURRICULUM
+from src.training.curriculum_aggressive_noise import CurriculumScheduler, AGGRESSIVE_NOISE_CURRICULUM
+
+
+def create_model(config: TRMConfig) -> RecursivePeptideModel:
+    """Create model from config."""
+    return RecursivePeptideModel(config)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Optimized training script for peptide TRM.")
+    parser = argparse.ArgumentParser(description="Aggressive noise training for peptide TRM.")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to a checkpoint to resume training from.")
     args = parser.parse_args()
 
@@ -42,12 +49,19 @@ def main():
         print("✓ CUDA cache cleared.")
 
     # Load config
-    config_path = project_root / 'configs' / 'optimized_extended.yaml'
+    config_path = project_root / 'configs' / 'aggressive_noise_test.yaml'
     cfg = OmegaConf.load(config_path)
 
-    print("=" * 60)
-    print("Recursive Peptide Model - Optimized Training")
-    print("=" * 60)
+    print("=" * 70)
+    print("AGGRESSIVE NOISE TRAINING - FORCE RECURSION")
+    print("=" * 70)
+    print("\nStrategy:")
+    print("  ✓ Exponential iteration weighting (force step 7 optimization)")
+    print("  ✓ Aggressive noise from step 0 (5 peaks, 15% dropout)")
+    print("  ✓ Precursor loss enabled (0.05 → 0.3)")
+    print("  ✓ Spectrum loss DISABLED (not worth debugging)")
+    print("  ✓ Batch size 80 + compile (confirmed working)")
+    print("=" * 70)
 
     # Create model
     model_config = TRMConfig(**cfg.model)
@@ -60,8 +74,6 @@ def main():
     print(f"  Latent steps: {model_config.num_latent_steps}")
 
     # Create datasets
-    # Training dataset uses MS2PIP realistic spectra
-    # Curriculum will dynamically adjust its difficulty.
     train_dataset = MS2PIPSyntheticDataset(
         max_peaks=model_config.max_peaks,
         max_seq_len=model_config.max_seq_len,
@@ -79,71 +91,68 @@ def main():
         ms2pip_model=cfg.data.ms2pip_model,
     )
 
-    # Hard validation: realistic noise, longer peptides
+    # Hard validation: realistic conditions matching real MS/MS data
+    # Based on Nine-Species dataset characteristics:
+    # - ~100 peaks per spectrum, mass range 100-1600 Da
+    # - Real instrument noise, missing peaks, mass calibration errors
     val_dataset_hard = MS2PIPSyntheticDataset(
-        min_length=12,
-        max_length=18,
-        noise_peaks=8,
-        peak_dropout=0.15,
-        mass_error_ppm=15.0,
+        min_length=8,
+        max_length=25,          # Real peptides can be longer
+        noise_peaks=20,         # Real spectra have many unexplained peaks
+        peak_dropout=0.25,      # ~25% of theoretical peaks missing
+        mass_error_ppm=15.0,    # Typical instrument accuracy
+        intensity_variation=0.3,
         ms2pip_model=cfg.data.ms2pip_model,
     )
 
     print(f"\nDataset created (using MS2PIP):")
-    print(f"  Train peptide length: Managed by curriculum")
+    print(f"  Train peptide length: Managed by aggressive curriculum")
     print(f"  Val (Easy) length: 7-10 (clean)")
-    print(f"  Val (Hard) length: 12-18 (realistic noise)")
+    print(f"  Val (Hard) length: 8-25 (realistic: 20 noise, 25% dropout, 15ppm)")
     print(f"  MS2PIP model: {cfg.data.ms2pip_model}")
 
-    # Create real data validation datasets (if enabled)
+    # Real data validation datasets
     val_dataset_proteometools = None
     val_dataset_nine_species = None
-    real_data_cfg = cfg.get('real_data_validation', {})
 
-    if real_data_cfg.get('enabled', False):
-        print(f"\nReal data validation enabled:")
+    pt_dir = project_root / 'data' / 'proteometools'
+    if pt_dir.exists():
+        try:
+            val_dataset_proteometools = ProteomeToolsDataset(
+                data_dir=pt_dir,
+                split='val',
+                max_peaks=model_config.max_peaks,
+                max_seq_len=model_config.max_seq_len,
+                max_samples=5000,
+            )
+            print(f"  ProteomeTools: {len(val_dataset_proteometools)} validation samples")
+        except Exception as e:
+            print(f"  ProteomeTools: Failed to load - {e}")
 
-        # ProteomeTools validation
-        pt_cfg = real_data_cfg.get('proteometools', {})
-        if pt_cfg.get('enabled', False):
-            pt_data_dir = project_root / pt_cfg.get('data_dir', 'data/proteometools')
-            if pt_data_dir.exists():
-                try:
-                    val_dataset_proteometools = ProteomeToolsDataset(
-                        data_dir=pt_data_dir,
-                        split='val',
-                        max_peaks=model_config.max_peaks,
-                        max_seq_len=model_config.max_seq_len,
-                        max_samples=pt_cfg.get('max_samples', None),
-                    )
-                    print(f"  ProteomeTools: {len(val_dataset_proteometools)} validation samples")
-                except Exception as e:
-                    print(f"  ProteomeTools: Failed to load - {e}")
-            else:
-                print(f"  ProteomeTools: Data dir not found ({pt_data_dir})")
-
-        # Nine-Species validation
-        ns_cfg = real_data_cfg.get('nine_species', {})
-        if ns_cfg.get('enabled', False):
-            ns_data_dir = project_root / ns_cfg.get('data_dir', 'data/nine_species')
-            if ns_data_dir.exists():
-                try:
-                    val_dataset_nine_species = NineSpeciesDataset(
-                        data_dir=ns_data_dir,
-                        split='val',
-                        max_peaks=model_config.max_peaks,
-                        max_seq_len=model_config.max_seq_len,
-                        use_balanced=ns_cfg.get('use_balanced', True),
-                        max_samples=ns_cfg.get('max_samples', None),
-                    )
-                    print(f"  Nine-Species: {len(val_dataset_nine_species)} validation samples")
-                except Exception as e:
-                    print(f"  Nine-Species: Failed to load - {e}")
-            else:
-                print(f"  Nine-Species: Data dir not found ({ns_data_dir})")
+    ns_dir = project_root / 'data' / 'nine_species'
+    if ns_dir.exists():
+        try:
+            val_dataset_nine_species = NineSpeciesDataset(
+                data_dir=ns_dir,
+                split='val',
+                max_peaks=model_config.max_peaks,
+                max_seq_len=model_config.max_seq_len,
+                use_balanced=True,
+                max_samples=5000,
+            )
+            print(f"  Nine-Species: {len(val_dataset_nine_species)} validation samples")
+        except Exception as e:
+            print(f"  Nine-Species: Failed to load - {e}")
 
     # Create curriculum scheduler
-    curriculum = CurriculumScheduler(DELAYED_SPECTRUM_CURRICULUM, train_dataset)
+    curriculum = CurriculumScheduler(AGGRESSIVE_NOISE_CURRICULUM, train_dataset)
+
+    print("\n📚 Aggressive Noise Curriculum:")
+    print(f"  Total stages: {len(AGGRESSIVE_NOISE_CURRICULUM)}")
+    print(f"  Total steps: {sum(s.steps for s in AGGRESSIVE_NOISE_CURRICULUM):,}")
+    print(f"  Stage 1: 5 noise peaks, 15% dropout")
+    print(f"  Stage 3: 15 noise peaks, 30% dropout (realistic!)")
+    print(f"  Stage 6-7: 30 noise peaks, 45% dropout (extreme!)")
 
     # Custom collate function for MS2PIPSample dataclasses
     def collate_fn(batch):
@@ -168,7 +177,7 @@ def main():
     )
     val_loader_easy = DataLoader(
         val_dataset_easy,
-        batch_size=64,  # Smaller batch size for validation
+        batch_size=64,
         num_workers=2,
         collate_fn=collate_fn,
         pin_memory=True,
@@ -181,15 +190,14 @@ def main():
         pin_memory=True,
     )
 
-    # Create real data validation loaders
+    # Real data validation loaders
     val_loader_proteometools = None
     val_loader_nine_species = None
 
     if val_dataset_proteometools is not None:
-        pt_batch_size = real_data_cfg.get('proteometools', {}).get('batch_size', 64)
         val_loader_proteometools = DataLoader(
             val_dataset_proteometools,
-            batch_size=pt_batch_size,
+            batch_size=64,
             num_workers=2,
             collate_fn=collate_fn,
             pin_memory=True,
@@ -197,10 +205,9 @@ def main():
         )
 
     if val_dataset_nine_species is not None:
-        ns_batch_size = real_data_cfg.get('nine_species', {}).get('batch_size', 64)
         val_loader_nine_species = DataLoader(
             val_dataset_nine_species,
-            batch_size=ns_batch_size,
+            batch_size=64,
             num_workers=2,
             collate_fn=collate_fn,
             pin_memory=True,
@@ -217,8 +224,8 @@ def main():
         print(f"  VRAM: {gpu_memory:.1f} GB")
     elif torch.backends.mps.is_available():
         training_config.device = 'mps'
-        training_config.use_amp = False  # MPS doesn't support AMP yet
-        training_config.use_compile = False  # MPS doesn't support compile yet
+        training_config.use_amp = False
+        training_config.use_compile = False
         print(f"\n✓ MPS available - using Apple Silicon GPU")
         print(f"  Note: AMP and compile disabled (not supported on MPS)")
     else:
@@ -228,9 +235,6 @@ def main():
         print(f"\n! No GPU available - using CPU")
 
     # Create trainer
-    real_data_eval_interval = real_data_cfg.get('eval_interval', 2000)
-    real_data_num_batches = real_data_cfg.get('proteometools', {}).get('num_batches', 20)
-
     trainer = OptimizedTrainer(
         model=model,
         train_loader=train_loader,
@@ -241,23 +245,29 @@ def main():
         val_loader_nine_species=val_loader_nine_species,
         curriculum=curriculum,
         use_wandb=True,
-        real_data_eval_interval=real_data_eval_interval,
-        real_data_num_batches=real_data_num_batches,
+        real_data_eval_interval=2000,
+        real_data_num_batches=20,
     )
 
-    print(f"\nOptimized training configuration:")
+    print(f"\nTraining configuration:")
     print(f"  Batch size: {training_config.batch_size}")
-    print(f"  Mixed precision: {training_config.use_amp}")
+    print(f"  Mixed precision: {training_config.use_amp} ({training_config.amp_dtype})")
     print(f"  Model compilation: {training_config.use_compile}")
     print(f"  Learning rate: {training_config.learning_rate}")
-    print(f"  Max steps: {training_config.max_steps}")
-    print(f"  Extended curriculum: {training_config.use_curriculum}")
+    print(f"  Max steps: {training_config.max_steps:,}")
+    print(f"  Iteration weighting: {training_config.iteration_weights}")
+    print(f"  Spectrum loss: DISABLED (weight={training_config.spectrum_weight})")
+    print(f"  Precursor loss: Curriculum-managed")
     print(f"  Device: {training_config.device}")
 
     if args.resume_from:
+        print(f"\n⚠️  Resuming from: {args.resume_from}")
         trainer.load_checkpoint(args.resume_from)
 
     # Train
+    print("\n" + "=" * 70)
+    print("STARTING TRAINING")
+    print("=" * 70)
     trainer.train()
 
 

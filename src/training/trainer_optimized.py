@@ -25,6 +25,7 @@ from ..model.trm import RecursivePeptideModel
 from .losses import DeepSupervisionLoss, CombinedLoss
 from .metrics import compute_metrics
 from .curriculum import CurriculumScheduler, DEFAULT_CURRICULUM
+from .refinement_tracker import compute_refinement_metrics
 from ..data.ion_types import get_ion_types_for_model
 from ..constants import PROTON_MASS
 
@@ -97,6 +98,17 @@ class EMA:
         return self.shadow.state_dict()
 
     def load_state_dict(self, state_dict):
+        # Handle prefix mismatch between compiled/non-compiled models
+        checkpoint_is_compiled = any(k.startswith('_orig_mod.') for k in state_dict.keys())
+        current_is_compiled = any(k.startswith('_orig_mod.') for k in self.shadow.state_dict().keys())
+
+        if checkpoint_is_compiled and not current_is_compiled:
+            # Checkpoint from compiled model, loading into non-compiled → strip prefix
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        elif not checkpoint_is_compiled and current_is_compiled:
+            # Checkpoint from non-compiled model, loading into compiled → add prefix
+            state_dict = {f'_orig_mod.{k}': v for k, v in state_dict.items()}
+
         self.shadow.load_state_dict(state_dict)
 
 
@@ -112,8 +124,12 @@ class OptimizedTrainer:
         config: TrainingConfig,
         val_loader_easy: Optional[DataLoader] = None,
         val_loader_hard: Optional[DataLoader] = None,
+        val_loader_proteometools: Optional[DataLoader] = None,
+        val_loader_nine_species: Optional[DataLoader] = None,
         curriculum: Optional[CurriculumScheduler] = None,
         use_wandb: bool = False,
+        real_data_eval_interval: int = 2000,
+        real_data_num_batches: int = 20,
     ):
         """
         Args:
@@ -122,8 +138,12 @@ class OptimizedTrainer:
             config: Training configuration
             val_loader_easy: Easy validation set (clean data, short peptides)
             val_loader_hard: Hard validation set (realistic noise, longer peptides)
+            val_loader_proteometools: ProteomeTools validation set (synthetic peptide library)
+            val_loader_nine_species: Nine-Species validation set (real biological data)
             curriculum: Curriculum scheduler for progressive difficulty
             use_wandb: Whether to log to Weights & Biases
+            real_data_eval_interval: How often to evaluate on real data (steps)
+            real_data_num_batches: Number of batches to use for real data evaluation
         """
         self.config = config
         self.device = torch.device(config.device)
@@ -159,6 +179,10 @@ class OptimizedTrainer:
         self.train_loader = train_loader
         self.val_loader_easy = val_loader_easy
         self.val_loader_hard = val_loader_hard
+        self.val_loader_proteometools = val_loader_proteometools
+        self.val_loader_nine_species = val_loader_nine_species
+        self.real_data_eval_interval = real_data_eval_interval
+        self.real_data_num_batches = real_data_num_batches
 
         # Optimizer
         self.optimizer = AdamW(
@@ -214,6 +238,8 @@ class OptimizedTrainer:
         if self.use_wandb:
             try:
                 import wandb
+                import os
+
                 tags = ['optimized']
                 if self.use_amp:
                     tags.append('amp')
@@ -221,11 +247,34 @@ class OptimizedTrainer:
                     tags.append('compiled')
                 tags.append(f'batch_{config.batch_size}')
 
-                wandb.init(
-                    project="peptide-trm",
-                    config=vars(config),
-                    tags=tags,
-                )
+                # Check for resume parameters from environment
+                wandb_run_id = os.environ.get('WANDB_RUN_ID', None)
+                wandb_resume = os.environ.get('WANDB_RESUME', None)
+
+                # Check for grouping (for checkpoint branching experiments)
+                wandb_group = os.environ.get('WANDB_RUN_GROUP', None)
+                wandb_job_type = os.environ.get('WANDB_JOB_TYPE', None)
+
+                if wandb_run_id:
+                    print(f"📊 Resuming W&B run: {wandb_run_id}")
+                    wandb.init(
+                        project="peptide-trm",
+                        id=wandb_run_id,
+                        resume="allow" if wandb_resume == "allow" else "must",
+                        group=wandb_group,
+                        job_type=wandb_job_type,
+                        config=vars(config),
+                        tags=tags,
+                    )
+                else:
+                    print(f"📊 Starting new W&B run")
+                    wandb.init(
+                        project="peptide-trm",
+                        group=wandb_group,
+                        job_type=wandb_job_type,
+                        config=vars(config),
+                        tags=tags,
+                    )
             except ImportError:
                 print("⚠️  wandb not installed, logging disabled")
                 self.use_wandb = False
@@ -318,6 +367,16 @@ class OptimizedTrainer:
                 mask=batch['sequence_mask'],
             )
             metrics.update(acc_metrics)
+
+            # Compute refinement metrics (edit rate, improvement per step)
+            # Only compute at log intervals to reduce overhead
+            if self.global_step % self.config.log_interval == 0:
+                refinement_metrics = compute_refinement_metrics(
+                    all_logits=all_logits.float(),
+                    targets=batch['sequence'],
+                    target_mask=batch['sequence_mask'],
+                )
+                metrics.update(refinement_metrics)
 
         return loss.item(), metrics
 
@@ -416,6 +475,42 @@ class OptimizedTrainer:
                                 f'val_hard/{k}': v for k, v in val_hard_metrics.items()
                             }, step=self.global_step)
 
+                # Real data validation (less frequent)
+                if self.global_step % self.real_data_eval_interval == 0:
+                    # ProteomeTools validation (synthetic peptide library)
+                    if self.val_loader_proteometools is not None:
+                        pt_metrics = self.evaluate(
+                            self.val_loader_proteometools,
+                            num_batches=self.real_data_num_batches
+                        )
+                        tqdm.write(
+                            f"Val (ProteomeTools) | Token Acc: {pt_metrics['token_accuracy']:.3f} | "
+                            f"Seq Acc: {pt_metrics['sequence_accuracy']:.3f}"
+                        )
+
+                        if self.use_wandb:
+                            import wandb
+                            wandb.log({
+                                f'val_proteometools/{k}': v for k, v in pt_metrics.items()
+                            }, step=self.global_step)
+
+                    # Nine-Species validation (real biological data)
+                    if self.val_loader_nine_species is not None:
+                        ns_metrics = self.evaluate(
+                            self.val_loader_nine_species,
+                            num_batches=self.real_data_num_batches
+                        )
+                        tqdm.write(
+                            f"Val (Nine-Species) | Token Acc: {ns_metrics['token_accuracy']:.3f} | "
+                            f"Seq Acc: {ns_metrics['sequence_accuracy']:.3f}"
+                        )
+
+                        if self.use_wandb:
+                            import wandb
+                            wandb.log({
+                                f'val_nine_species/{k}': v for k, v in ns_metrics.items()
+                            }, step=self.global_step)
+
                 # Checkpointing
                 if self.global_step % self.config.save_interval == 0 and self.global_step > 0:
                     self.save_checkpoint(f'checkpoint_step_{self.global_step}.pt')
@@ -435,12 +530,13 @@ class OptimizedTrainer:
         print(f"{'='*60}")
 
     @torch.no_grad()
-    def evaluate(self, val_loader: DataLoader):
+    def evaluate(self, val_loader: DataLoader, num_batches: int = 10):
         """
         Evaluate on validation set.
 
         Args:
-            val_loader: Validation data loader (easy or hard)
+            val_loader: Validation data loader (easy, hard, or real data)
+            num_batches: Maximum number of batches to evaluate (for quick validation)
 
         Returns:
             Dict of average metrics
@@ -448,7 +544,7 @@ class OptimizedTrainer:
         self.model.eval()
 
         total_metrics = {}
-        num_batches = 0
+        batch_count = 0
 
         for batch in val_loader:
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -474,14 +570,25 @@ class OptimizedTrainer:
                 mask=batch['sequence_mask'],
             )
 
+            # Compute refinement metrics (edit rate, improvement per step)
+            refinement_metrics = compute_refinement_metrics(
+                all_logits=all_logits.float(),
+                targets=batch['sequence'],
+                target_mask=batch['sequence_mask'],
+            )
+            metrics.update(refinement_metrics)
+
             for k, v in metrics.items():
                 total_metrics[k] = total_metrics.get(k, 0) + v
-            num_batches += 1
+            batch_count += 1
 
-            if num_batches >= 10:  # Quick validation
+            if batch_count >= num_batches:
                 break
 
-        return {k: v / num_batches for k, v in total_metrics.items()}
+        if batch_count == 0:
+            return {'token_accuracy': 0.0, 'sequence_accuracy': 0.0}
+
+        return {k: v / batch_count for k, v in total_metrics.items()}
 
     def save_checkpoint(self, filename):
         """Save model checkpoint."""
@@ -518,7 +625,19 @@ class OptimizedTrainer:
         """
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Handle prefix mismatch between compiled/non-compiled models
+        model_state = checkpoint['model_state_dict']
+        checkpoint_is_compiled = any(k.startswith('_orig_mod.') for k in model_state.keys())
+        current_is_compiled = any(k.startswith('_orig_mod.') for k in self.model.state_dict().keys())
+
+        if checkpoint_is_compiled and not current_is_compiled:
+            # Checkpoint from compiled model, loading into non-compiled → strip prefix
+            model_state = {k.replace('_orig_mod.', ''): v for k, v in model_state.items()}
+        elif not checkpoint_is_compiled and current_is_compiled:
+            # Checkpoint from non-compiled model, loading into compiled → add prefix
+            model_state = {f'_orig_mod.{k}': v for k, v in model_state.items()}
+
+        self.model.load_state_dict(model_state)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 

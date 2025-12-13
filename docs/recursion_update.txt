@@ -1,0 +1,78 @@
+these codeblocks demonstrate time embeddings and residual format to improve recursion in the model
+
+class RecursiveDecoder(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        max_seq_len: int = 35,
+        vocab_size: int = VOCAB_SIZE,
+        num_latent_steps: int = 8,  # Add this argument
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        
+        # ... existing code ...
+
+        # --- FIX 1: Add Step Embedding ---
+        # Allows the network to learn different logic for "rough draft" (step 0)
+        # vs "polishing" (step N).
+        self.step_embedding = nn.Embedding(num_latent_steps + 1, hidden_dim)
+
+        def forward(self, encoded_spectrum, spectrum_mask, num_supervision_steps=None, return_all_steps=True):
+        batch_size = encoded_spectrum.size(0)
+        device = encoded_spectrum.device
+        
+        # Initialize
+        # y: current prediction logits
+        # z: current latent "thought" vector
+        y, z = self.get_initial_state(batch_size, device)
+        
+        all_logits = []
+        
+        # Determine total steps
+        steps = num_supervision_steps or self.config.num_latent_steps
+
+        for step in range(steps):
+            # --- FIX 2: Inject Step Embedding ---
+            # We add the embedding for the current step to the latent state z.
+            # This perturbs z, preventing it from getting stuck in a fixed point.
+            step_emb = self.step_embedding(torch.tensor(step, device=device))
+            
+            # Broadcast step_emb to (batch, seq_len, hidden)
+            z_input = z + step_emb.unsqueeze(0).unsqueeze(0)
+            
+            # --- FIX 3: Residual Update ---
+            # Don't do: z = layer(z)
+            # Do:       z = z + layer(z)
+            # This forces the network to learn the *refinement* (delta), not the state.
+            
+            # Get probabilities for soft embedding
+            probs = torch.softmax(y, dim=-1)
+            y_soft = self.soft_embed(probs)
+            
+            # Run the shared transformer layers
+            # Note: This implementation depends on your exact layer signatures
+            # We pass z_input as query, encoded_spectrum as key/value
+            z_delta = z_input
+            for layer in self.layers:
+                z_delta = layer(
+                    z_delta, 
+                    memory=encoded_spectrum,
+                    tgt_key_padding_mask=None, # Add masks as needed
+                    memory_key_padding_mask=~spectrum_mask
+                )
+            
+            # Apply residual connection (Standard ResNet/ODE logic)
+            z = self.norm(z + z_delta)
+            
+            # Predict new logits from updated z
+            y = self.output_head(z)
+            
+            if return_all_steps:
+                all_logits.append(y)
+
+        if return_all_steps:
+            return torch.stack(all_logits), z
+        return y, z

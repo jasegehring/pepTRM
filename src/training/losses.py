@@ -123,7 +123,7 @@ class SpectrumMatchingLoss(nn.Module):
         self,
         bin_size: float = 0.1,         # Resolution of the spectral grid (Da)
         max_mz: float = 2000.0,        # Maximum m/z to consider
-        sigma: float = 0.05,           # Gaussian width (standard deviation)
+        sigma: float = 0.2,            # Gaussian width for peak matching (Da)
         ion_type_names: Optional[List[str]] = None,
         ms2pip_model: Optional[str] = None,
     ):
@@ -189,79 +189,95 @@ class SpectrumMatchingLoss(nn.Module):
         observed_masses: Tensor,      # (batch, max_peaks)
         observed_intensities: Tensor, # (batch, max_peaks)
         peak_mask: Tensor,            # (batch, max_peaks)
+        sequence_mask: Optional[Tensor] = None,  # (batch, seq_len)
     ) -> Tensor:
         """
-        Compute spectrum matching loss via Gaussian rendering.
+        Compute spectrum matching loss via soft peak matching.
+
+        Instead of comparing rendered spectra (which fails due to intensity mismatch),
+        we directly measure how well predicted peaks explain observed peaks using
+        Gaussian kernels. This approach is intensity-agnostic for predicted peaks.
+
+        Args:
+            sequence_probs: Probability distribution over sequences
+            observed_masses: Observed peak m/z values
+            observed_intensities: Observed peak intensities
+            peak_mask: Mask for valid observed peaks
+            sequence_mask: Mask for valid sequence positions (prevents PAD from contributing)
 
         Returns:
-            loss: Scalar in range [0, 2], where 0 = perfect match
+            loss: Scalar in range [0, 1], where 0 = perfect coverage
         """
         # 1. Compute Predicted Theoretical Peaks (Differentiable)
+        # Shape: (batch, num_predicted_peaks)
         predicted_masses = compute_theoretical_peaks(
             sequence_probs=sequence_probs,
             aa_masses=self.aa_masses,
             ion_type_names=self.ion_type_names,
+            sequence_mask=sequence_mask,
         )
 
-        # 2. Render Predicted Spectrum (uniform intensity)
-        pred_spectrum = self._gaussian_render(predicted_masses)
+        # 2. Soft Peak Matching: For each observed peak, compute coverage by predicted peaks
+        # Compute pairwise distances: (batch, num_observed, num_predicted)
+        # observed: (batch, max_peaks) -> (batch, max_peaks, 1)
+        # predicted: (batch, num_predicted) -> (batch, 1, num_predicted)
+        mass_diff = observed_masses.unsqueeze(-1) - predicted_masses.unsqueeze(1)
 
-        # 3. Render Observed Spectrum
-        with torch.no_grad():
-            # Mask out padding in observed data
-            obs_masses_masked = observed_masses * peak_mask.float()
-            obs_intens_masked = observed_intensities * peak_mask.float()
+        # Gaussian kernel: how well does each predicted peak explain each observed peak
+        # Shape: (batch, num_observed, num_predicted)
+        match_scores = torch.exp(-0.5 * (mass_diff / self.sigma) ** 2)
 
-            target_spectrum = self._gaussian_render(obs_masses_masked, obs_intens_masked)
+        # For each observed peak, take max match score across all predicted peaks
+        # This gives: "how well is this observed peak explained by ANY predicted peak"
+        # Shape: (batch, num_observed)
+        peak_coverage = match_scores.max(dim=-1)[0]
 
-            # Normalize target spectrum to max 1.0 for stability
-            target_max = target_spectrum.max(dim=1, keepdim=True)[0].clamp(min=1e-8)
-            target_spectrum = target_spectrum / target_max
+        # 3. Weight by observed intensities (important peaks should be explained better)
+        # Normalize intensities to sum to 1 for each sample
+        obs_intens_norm = observed_intensities * peak_mask.float()
+        intens_sum = obs_intens_norm.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        obs_weights = obs_intens_norm / intens_sum
 
-        # 4. Normalize Predicted Spectrum (ensures loss depends on shape, not magnitude)
-        pred_max = pred_spectrum.max(dim=1, keepdim=True)[0].clamp(min=1e-8)
-        pred_spectrum = pred_spectrum / pred_max
+        # Weighted coverage score: average of how well important peaks are explained
+        # Shape: (batch,)
+        weighted_coverage = (peak_coverage * obs_weights).sum(dim=1)
 
-        # 5. Compute Cosine Similarity Loss
-        # 1.0 - CosineSimilarity. Perfect match = 0.0 loss, orthogonal = 2.0 loss
-        similarity = F.cosine_similarity(pred_spectrum, target_spectrum, dim=1)
-        loss = 1.0 - similarity.mean()
+        # 4. Loss is 1 - coverage (perfect coverage = 0 loss)
+        loss = 1.0 - weighted_coverage.mean()
 
         return loss
 
 
 class PrecursorMassLoss(nn.Module):
     """
-    Precursor mass constraint with log-scaling for robust gradients.
+    Precursor mass constraint scaled in 'Amino Acid Units'.
 
-    Penalizes predictions whose total mass doesn't match the given precursor mass.
-    Uses log-scaling to provide:
-    - Bounded growth for large errors (prevents explosion)
-    - Strong gradients for small errors
-    - Non-zero gradients even for very large errors
-    - Interpretable ppm metrics
+    Philosophy:
+    - CrossEntropy loss penalizes wrong tokens with ~2.0-5.0 loss
+    - Normalize mass error by ~110 Da (avg AA mass) so 1 AA error ≈ 1.0 loss
+    - This keeps gradients balanced without magic weights
+    - Uses Smooth L1 (Huber) for robustness to outliers
+
+    Example:
+        - 1 AA wrong (110 Da error) → loss ≈ 1.0 (same magnitude as CE)
+        - 2 AA wrong (220 Da error) → loss ≈ 2.0
+        - Small errors (< 11 Da) → quadratic (smooth gradients)
+        - Large errors (> 11 Da) → linear (bounded gradients)
     """
 
-    def __init__(
-        self,
-        use_relative: bool = True,     # Use relative error (ppm) instead of absolute (Da)
-        loss_scale: float = 100000.0,  # Scale parameter for log loss (100k ppm = 10% error)
-        use_log_loss: bool = True,     # Use log(1 + error/scale) for bounded gradients
-    ):
+    def __init__(self, avg_aa_mass: float = 110.0, huber_beta: float = 0.1):
         """
         Args:
-            use_relative: Use ppm errors (True) or absolute Da errors (False)
-            loss_scale: Scaling for log loss. With 100k ppm:
-                - 100k ppm (10% error) → log(2) ≈ 0.69
-                - 10k ppm (1% error) → log(1.1) ≈ 0.095
-                - 1k ppm (0.1% error) → log(1.01) ≈ 0.01
-            use_log_loss: Use log scaling (True) or clamping (False, legacy)
+            avg_aa_mass: Average amino acid mass for normalization (default: 110 Da)
+            huber_beta: Beta parameter for Smooth L1 loss (in AA units)
+                       beta=0.1 means errors < 11 Da are quadratic, > 11 Da are linear
         """
         super().__init__()
-        self.use_relative = use_relative
-        self.loss_scale = loss_scale
-        self.use_log_loss = use_log_loss
+        self.avg_aa_mass = avg_aa_mass
+        self.huber_beta = huber_beta
 
+        # AA masses - special tokens (PAD, SOS, EOS, UNK) have mass 0.0
+        # This is intentional: if model predicts EOS, it contributes 0 mass
         aa_masses = torch.tensor([AMINO_ACID_MASSES.get(aa, 0.0) for aa in VOCAB])
         self.register_buffer('aa_masses', aa_masses)
 
@@ -269,46 +285,53 @@ class PrecursorMassLoss(nn.Module):
         self,
         sequence_probs: Tensor,    # (batch, seq_len, vocab)
         precursor_mass: Tensor,    # (batch,)
-        sequence_mask: Tensor,     # (batch, seq_len)
+        sequence_mask: Tensor,     # (batch, seq_len) - True for valid positions
     ) -> Tuple[Tensor, Dict[str, float]]:
         """
-        Compute precursor mass constraint loss.
+        Compute precursor mass constraint loss in AA units.
+
+        Key insight: We do NOT mask special tokens. The aa_masses buffer has
+        mass=0 for PAD/SOS/EOS/UNK. If model correctly predicts EOS at end of
+        sequence, it contributes 0 mass - which is correct! If model wrongly
+        predicts EOS at an AA position, expected mass drops, loss increases.
 
         Returns:
-            loss: Scalar loss value
-            metrics: Dict with mass_error_da, ppm_error, predicted_peptide_mass
+            loss: Scalar loss value (in AA units, comparable to CE loss)
+            metrics: Dict with soft (expected) and hard (argmax) errors
         """
-        # Calculate expected mass per position: E[mass_i] = sum_aa P(aa_i) * mass(aa)
+        # === EXPECTED MASS (for loss - gradients flow through this) ===
+        # E[mass_i] = sum_token P(token_i) * mass(token)
+        # Special tokens have mass=0, so they naturally contribute nothing
         expected_masses = torch.einsum('bsv,v->bs', sequence_probs, self.aa_masses)
+        expected_peptide_mass = (expected_masses * sequence_mask.float()).sum(dim=1)
+        expected_precursor_mass = expected_peptide_mass + WATER_MASS
 
-        # Sum valid positions
-        predicted_peptide_mass = (expected_masses * sequence_mask.float()).sum(dim=1)
+        # === PREDICTED MASS (for metrics - what we actually care about) ===
+        argmax_indices = sequence_probs.argmax(dim=-1)
+        argmax_masses = self.aa_masses[argmax_indices]
+        predicted_peptide_mass = (argmax_masses * sequence_mask.float()).sum(dim=1)
         predicted_precursor_mass = predicted_peptide_mass + WATER_MASS
 
-        # Absolute Error
-        mass_error = torch.abs(predicted_precursor_mass - precursor_mass)
+        # === LOSS ===
+        error_da = expected_precursor_mass - precursor_mass
+        loss = F.smooth_l1_loss(
+            error_da / self.avg_aa_mass,
+            torch.zeros_like(error_da),
+            beta=self.huber_beta,
+            reduction='mean'
+        )
 
-        if self.use_relative:
-            # Convert to ppm (parts per million)
-            ppm_error = (mass_error / precursor_mass.clamp(min=1.0)) * 1e6
-
-            if self.use_log_loss:
-                # Log scaling for bounded gradients
-                loss = torch.log1p(ppm_error / self.loss_scale)
-                loss = loss.mean()
-            else:
-                # Legacy: clamp extreme errors (kills gradients)
-                ppm_error_clamped = torch.clamp(ppm_error, max=self.loss_scale)
-                loss = ppm_error_clamped.mean()
-        else:
-            # Use absolute error in Daltons
-            ppm_error = (mass_error / precursor_mass.clamp(min=1.0)) * 1e6
-            loss = mass_error.mean()
+        # === METRICS ===
+        # Soft error: what loss optimizes (high when uncertain)
+        soft_error_da = error_da.abs()
+        # Hard error: actual prediction quality (what matters)
+        hard_error_da = (predicted_precursor_mass - precursor_mass).abs()
 
         metrics = {
-            'predicted_peptide_mass': predicted_peptide_mass.mean().item(),
-            'mass_error_da': mass_error.mean().item(),
-            'ppm_error': ppm_error.mean().item(),
+            # Primary: actual prediction error
+            'mass_error_da': hard_error_da.mean().item(),
+            # Secondary: explains gap between loss and prediction quality
+            'expected_mass_error_da': soft_error_da.mean().item(),
         }
 
         return loss, metrics
@@ -334,12 +357,12 @@ class CombinedLoss(nn.Module):
         # Spectrum args
         bin_size: float = 0.1,
         max_mz: float = 2000.0,
-        sigma: float = 0.05,
+        sigma: float = 0.2,  # INCREASED: More forgiving peak matching (was 0.05)
         ion_type_names: Optional[List[str]] = None,
         ms2pip_model: Optional[str] = None,
         # Precursor args
-        precursor_use_log: bool = True,
-        precursor_scale: float = 100000.0,
+        avg_aa_mass: float = 110.0,
+        huber_beta: float = 0.1,
     ):
         """
         Args:
@@ -350,11 +373,11 @@ class CombinedLoss(nn.Module):
             label_smoothing: Label smoothing for cross-entropy
             bin_size: Spectral grid resolution in Da
             max_mz: Maximum m/z for spectrum rendering
-            sigma: Gaussian kernel width
+            sigma: Gaussian kernel width for peak matching
             ion_type_names: Ion types to use (e.g., ['b', 'y', 'b++', 'y++'])
             ms2pip_model: MS2PIP model name (e.g., 'HCDch2')
-            precursor_use_log: Use log-scaling for precursor loss
-            precursor_scale: Scale parameter for precursor log loss
+            avg_aa_mass: Average AA mass for precursor loss normalization
+            huber_beta: Beta parameter for Smooth L1 in precursor loss
         """
         super().__init__()
         self.ce_weight = ce_weight
@@ -375,9 +398,8 @@ class CombinedLoss(nn.Module):
         )
 
         self.precursor_loss = PrecursorMassLoss(
-            use_relative=True,
-            loss_scale=precursor_scale,
-            use_log_loss=precursor_use_log,
+            avg_aa_mass=avg_aa_mass,
+            huber_beta=huber_beta,
         )
 
     def forward(
@@ -413,7 +435,8 @@ class CombinedLoss(nn.Module):
                     final_probs_f32,
                     observed_masses.float(),
                     observed_intensities.float(),
-                    peak_mask
+                    peak_mask,
+                    sequence_mask=target_mask  # Pass sequence mask to prevent PAD contribution
                 )
             else:
                 spec_loss = torch.tensor(0.0, device=ce_loss.device)

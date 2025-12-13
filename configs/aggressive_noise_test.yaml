@@ -1,0 +1,66 @@
+# Aggressive noise test to force multi-step refinement
+# No spectral loss, test precursor loss, exponential weighting
+
+model:
+  hidden_dim: 384
+  num_encoder_layers: 3
+  num_decoder_layers: 3
+  num_heads: 6
+  max_peaks: 100
+  max_seq_len: 35
+  num_supervision_steps: 8
+  num_latent_steps: 6
+  dropout: 0.1
+
+training:
+  # Optimization
+  learning_rate: 1.5e-4
+  weight_decay: 0.01
+  batch_size: 80  # Keep batch=80 for compilation to work
+  max_steps: 100000
+  warmup_steps: 2000
+
+  # Mixed Precision
+  use_amp: true
+  amp_dtype: 'bfloat16'
+
+  # Gradient Accumulation
+  gradient_accumulation_steps: 1
+
+  # Model Compilation
+  use_compile: true  # Worked with batch=80!
+  compile_mode: 'reduce-overhead'
+
+  # Loss configuration
+  ce_weight: 1.0
+  spectrum_weight: 0.0  # DISABLED - sigma too small, test later
+  iteration_weights: 'exponential'  # CHANGED from 'linear' - force late-step refinement!
+  label_smoothing: 0.1
+
+  # Curriculum - use aggressive noise
+  use_curriculum: true
+
+  # EMA
+  use_ema: true
+  ema_decay: 0.999
+
+  # Logging
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 5000
+
+  # Paths
+  checkpoint_dir: 'checkpoints_aggressive_noise'
+
+  # Device
+  device: 'cuda'
+
+data:
+  # MS2PIP settings
+  ms2pip_model: 'HCDch2'
+  top_k_peaks: 50
+
+  # Charge distribution
+  charge_distribution:
+    2: 0.7
+    3: 0.3

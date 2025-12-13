@@ -1,0 +1,60 @@
+proposed fix for loss function to include recall and precision
+
+def forward(
+        self,
+        sequence_probs: Tensor,       # (batch, seq_len, vocab)
+        observed_masses: Tensor,      # (batch, max_peaks)
+        observed_intensities: Tensor, # (batch, max_peaks)
+        peak_mask: Tensor,            # (batch, max_peaks)
+    ) -> Tensor:
+        """
+        Compute Symmetric Spectrum Matching Loss.
+        
+        Penalizes both:
+        1. Missed Peaks (Recall): Observed peaks with no nearby prediction.
+        2. Ghost Peaks (Precision): Predicted peaks with no nearby observation.
+        """
+        # 1. Compute Predicted Theoretical Peaks
+        # Shape: (batch, num_pred)
+        predicted_masses = compute_theoretical_peaks(
+            sequence_probs=sequence_probs,
+            aa_masses=self.aa_masses,
+            ion_type_names=self.ion_type_names,
+        )
+
+        # 2. Compute Match Matrix (Gaussian Kernel)
+        # (batch, num_obs, 1) - (batch, 1, num_pred)
+        # diff shape: (batch, num_obs, num_pred)
+        mass_diff = observed_masses.unsqueeze(-1) - predicted_masses.unsqueeze(1)
+        
+        # Similarity score [0, 1] for every pair
+        match_scores = torch.exp(-0.5 * (mass_diff / self.sigma) ** 2)
+
+        # --- A. RECALL (Observed -> Predicted) ---
+        # For each OBSERVED peak, what is the best PREDICTED match?
+        # Shape: (batch, num_obs)
+        recall_scores = match_scores.max(dim=-1)[0]
+        
+        # Weight by observed intensity (important peaks matter more)
+        obs_intens_norm = observed_intensities * peak_mask.float()
+        obs_weights = obs_intens_norm / (obs_intens_norm.sum(dim=1, keepdim=True).clamp(min=1e-8))
+        
+        weighted_recall = (recall_scores * obs_weights).sum(dim=1)
+
+        # --- B. PRECISION (Predicted -> Observed) ---
+        # For each PREDICTED peak, what is the best OBSERVED match?
+        # Shape: (batch, num_pred)
+        precision_scores = match_scores.max(dim=1)[0]
+        
+        # We weight predicted peaks equally (or you could weight by predicted intensity if you had it)
+        # We just want the average predicted peak to be close to *something* real.
+        avg_precision = precision_scores.mean(dim=1)
+
+        # --- C. COMBINE ---
+        # Loss = 1 - Harmonic Mean of Recall and Precision (F1-style)
+        # Or simple arithmetic mean. Arithmetic is safer for gradients.
+        
+        # We want to Maximize (Recall + Precision), so we Minimize (1 - Recall) + (1 - Precision)
+        loss = 1.0 - 0.5 * (weighted_recall + avg_precision).mean()
+
+        return losds

@@ -1,0 +1,71 @@
+class MatchedFilterSpectrumLoss(nn.Module):
+    """
+    Robust 'Matched Filter' Spectrum Loss.
+    
+    Philosophy: 
+    - We TRUST the observed peaks (Recall).
+    - We DO NOT TRUST the absence of peaks (Dropout).
+    
+    This loss maximizes the 'Energy' of the predicted signal at the 
+    observed locations. It ignores predicted peaks that land in 
+    empty space (assuming they might be valid ions that dropped out).
+    
+    Precision (preventing hallucinations) is enforced by the 
+    PrecursorMassLoss, not this loss.
+    """
+    def __init__(self, sigma=0.1, ion_type_names=None, ms2pip_model=None):
+        super().__init__()
+        self.sigma = sigma
+        
+        # ... standard ion setup ...
+        if ion_type_names is not None:
+            self.ion_type_names = ion_type_names
+        elif ms2pip_model is not None:
+            self.ion_type_names = get_ion_types_for_model(ms2pip_model)
+        else:
+            self.ion_type_names = ['b', 'y']
+            
+        aa_masses = torch.tensor([AMINO_ACID_MASSES.get(aa, 0.0) for aa in VOCAB])
+        self.register_buffer('aa_masses', aa_masses)
+
+    def forward(self, sequence_probs, observed_masses, observed_intensities, peak_mask):
+        # 1. Theoretical Peaks
+        # Shape: (batch, num_pred)
+        predicted_masses = compute_theoretical_peaks(
+            sequence_probs=sequence_probs,
+            aa_masses=self.aa_masses,
+            ion_type_names=self.ion_type_names,
+        )
+
+        # 2. Gaussian Overlap (The "Matched Filter")
+        # We want to measure: "How much of the Observed Intensity did we capture?"
+        
+        # Distance matrix: (batch, num_obs, num_pred)
+        diff = observed_masses.unsqueeze(-1) - predicted_masses.unsqueeze(1)
+        
+        # Gaussian Kernel: 1.0 if perfectly aligned, 0.0 if far
+        # Shape: (batch, num_obs, num_pred)
+        alignment_scores = torch.exp(-0.5 * (diff / self.sigma) ** 2)
+        
+        # 3. Best Match per Observed Peak
+        # "Did ANY of our predicted peaks explain this observed peak?"
+        # Shape: (batch, num_obs)
+        peak_match_score = alignment_scores.max(dim=-1)[0]
+        
+        # 4. Weight by Observed Intensity
+        # We care more about explaining the tall peaks than the noise
+        # Normalize intensities so the "Perfect Score" is 1.0
+        # Shape: (batch, num_obs)
+        masked_intensities = observed_intensities * peak_mask.float()
+        total_intensity = masked_intensities.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        weights = masked_intensities / total_intensity
+        
+        # 5. Compute Recall Score
+        # Range: [0.0, 1.0]
+        # 1.0 means we have a predicted peak perfectly aligned with every observed peak
+        recall_score = (peak_match_score * weights).sum(dim=1)
+        
+        # Loss is 1 - Recall
+        loss = 1.0 - recall_score.mean()
+        
+        return loss

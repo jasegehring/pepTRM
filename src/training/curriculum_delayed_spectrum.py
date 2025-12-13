@@ -1,11 +1,15 @@
 """
-Extended, smoother curriculum learning scheduler.
+MODIFIED CURRICULUM - Delayed Spectrum Loss Introduction
 
-Improvements over default curriculum:
-1. Longer stages (100K steps total vs 50K)
-2. Smoother transitions (more intermediate stages)
-3. Gradual noise introduction (0→1→2→3→5→8 peaks)
-4. Better sim-to-real transfer
+Changes from original curriculum:
+1. Extended pure CE training from 15K → 25K steps (give model time to reach 65% accuracy)
+2. Delayed spectrum loss introduction from step 15K → step 25K
+3. Gentler progression with more time at each stage
+
+Rationale:
+- Model at 48% token accuracy at step 15K (below expected 55%)
+- Spectrum loss needs ~60-65% accuracy for meaningful gradient signal (>10% coverage)
+- Better to build strong CE foundation before adding spectrum supervision
 """
 
 from dataclasses import dataclass
@@ -27,7 +31,7 @@ class CurriculumStage:
     min_length: int = 7
     max_length: int = 20
 
-    # Noise parameters (for noisy examples only)
+    # Noise parameters (for noisy examples only when clean_data_ratio < 1.0)
     noise_peaks: int = 0
     peak_dropout: float = 0.0
     mass_error_ppm: float = 0.0
@@ -41,153 +45,181 @@ class CurriculumStage:
     precursor_loss_weight: float = 0.0
 
 
-# IMPROVED 10-stage curriculum with smooth transitions and clean/noisy mixing
-# Key improvements:
-# 1. Introduce precursor loss early on CLEAN data (stage 2)
-# 2. Keep data 100% clean through stage 4 (40K steps)
-# 3. Mix clean/noisy data gradually (stages 5-9)
-# 4. Delay peak_dropout until stage 8 (it's very harsh)
-# 5. Smooth noise ramp: mass_error 1→2→5→8→12→15 ppm
-EXTENDED_CURRICULUM = [
-    # Stage 1 (0-10K): Foundation - Pure CE on clean data
+# Modified 10-stage curriculum: 100K steps total
+DELAYED_SPECTRUM_CURRICULUM = [
+    # ========================================================================
+    # PHASE 1: EXTENDED FOUNDATION (0-25K) - Pure CE, Build to 65% Accuracy
+    # ========================================================================
+
+    # Stage 1 (0-7.5K): Initial foundation
     CurriculumStage(
         name="stage_1_foundation",
-        steps=10000,
+        steps=7500,
         min_length=7,
         max_length=10,
         noise_peaks=0,
         peak_dropout=0.0,
         mass_error_ppm=0.0,
-        clean_data_ratio=1.0,  # 100% clean
-        spectrum_loss_weight=0.0,  # Pure CE first
-        precursor_loss_weight=0.0,  # No mass constraint yet
+        clean_data_ratio=1.0,
+        spectrum_loss_weight=0.0,  # Pure CE
+        precursor_loss_weight=0.0,
     ),
 
-    # Stage 2 (10K-20K): Add spectrum + precursor on CLEAN data
+    # Stage 2 (7.5K-15K): Continued foundation
     CurriculumStage(
-        name="stage_2_clean_constraints",
-        steps=10000,
+        name="stage_2_foundation",
+        steps=7500,
         min_length=7,
         max_length=10,
         noise_peaks=0,
         peak_dropout=0.0,
         mass_error_ppm=0.0,
-        clean_data_ratio=1.0,  # 100% clean - CRITICAL: Learn mass constraints first!
-        spectrum_loss_weight=0.05,   # Start learning fragment masses
-        precursor_loss_weight=0.01,  # EARLY introduction on clean data
+        clean_data_ratio=1.0,
+        spectrum_loss_weight=0.0,  # Still pure CE
+        precursor_loss_weight=0.0,
     ),
 
-    # Stage 3 (20K-30K): Stabilize losses on clean data
+    # Stage 3 (15K-22.5K): Extended stabilization - CHANGED FROM ORIGINAL
+    # ORIGINAL: Introduced spectrum loss here (0.08)
+    # MODIFIED: Continue pure CE to reach 65% accuracy
     CurriculumStage(
-        name="stage_3_clean_stabilization",
-        steps=10000,
+        name="stage_3_extended_stabilization",
+        steps=7500,
+        min_length=7,
+        max_length=11,  # Slightly longer peptides
+        noise_peaks=0,
+        peak_dropout=0.0,
+        mass_error_ppm=0.0,
+        clean_data_ratio=1.0,
+        spectrum_loss_weight=0.0,  # STILL PURE CE - Let model mature
+        precursor_loss_weight=0.0,
+    ),
+
+    # Stage 4 (22.5K-30K): Pre-spectrum ramp - NEW STAGE
+    # Give model time to reach 65%+ accuracy before spectrum introduction
+    CurriculumStage(
+        name="stage_4_pre_spectrum_ramp",
+        steps=7500,
         min_length=7,
         max_length=12,
         noise_peaks=0,
         peak_dropout=0.0,
         mass_error_ppm=0.0,
-        clean_data_ratio=1.0,  # 100% clean - let losses stabilize
-        spectrum_loss_weight=0.08,
-        precursor_loss_weight=0.02,
+        clean_data_ratio=1.0,
+        spectrum_loss_weight=0.0,  # LAST STAGE OF PURE CE
+        precursor_loss_weight=0.0,
     ),
 
-    # Stage 4 (30K-40K): Pre-noise refinement
+    # ========================================================================
+    # PHASE 2: FRAGMENT PHYSICS (30K-45K) - Introduce Spectrum Loss
+    # ========================================================================
+
+    # Stage 5 (30K-37.5K): Spectrum introduction - DELAYED FROM 15K
+    # Now model should be at ~65-70% accuracy with 10-15% spectrum coverage
     CurriculumStage(
-        name="stage_4_clean_refinement",
-        steps=10000,
+        name="stage_5_spectrum_intro",
+        steps=7500,
         min_length=7,
-        max_length=14,
+        max_length=12,
         noise_peaks=0,
         peak_dropout=0.0,
         mass_error_ppm=0.0,
-        clean_data_ratio=1.0,  # 100% clean - get accuracy high before noise
-        spectrum_loss_weight=0.10,
-        precursor_loss_weight=0.03,
+        clean_data_ratio=1.0,
+        spectrum_loss_weight=0.06,  # GENTLER START (was 0.08)
+        precursor_loss_weight=0.0,
     ),
 
-    # Stage 5 (40K-50K): Minimal noise introduction (mostly clean)
+    # Stage 6 (37.5K-45K): Spectrum ramp-up
     CurriculumStage(
-        name="stage_5_minimal_noise",
+        name="stage_6_spectrum_ramp",
+        steps=7500,
+        min_length=7,
+        max_length=13,
+        noise_peaks=0,
+        peak_dropout=0.0,
+        mass_error_ppm=0.0,
+        clean_data_ratio=1.0,
+        spectrum_loss_weight=0.10,
+        precursor_loss_weight=0.0,
+    ),
+
+    # ========================================================================
+    # PHASE 3: MASS CONSTRAINT + GRADUAL MIXING (45K-75K)
+    # ========================================================================
+
+    # Stage 7 (45K-55K): Precursor intro + Light mixing
+    CurriculumStage(
+        name="stage_7_precursor_light_mix",
+        steps=10000,
+        min_length=7,
+        max_length=14,
+        noise_peaks=1,
+        peak_dropout=0.0,
+        mass_error_ppm=1.0,
+        clean_data_ratio=0.8,
+        spectrum_loss_weight=0.15,
+        precursor_loss_weight=0.01,
+    ),
+
+    # Stage 8 (55K-65K): Moderate mixing
+    CurriculumStage(
+        name="stage_8_moderate_mix",
         steps=10000,
         min_length=7,
         max_length=15,
-        noise_peaks=1,       # Minimal noise when used
-        peak_dropout=0.0,    # NO dropout yet
-        mass_error_ppm=1.0,  # Very small mass errors
-        clean_data_ratio=0.8,  # 80% clean, 20% noisy - smooth introduction
-        spectrum_loss_weight=0.12,
-        precursor_loss_weight=0.04,
+        noise_peaks=3,
+        peak_dropout=0.0,
+        mass_error_ppm=5.0,
+        clean_data_ratio=0.5,
+        spectrum_loss_weight=0.18,
+        precursor_loss_weight=0.03,
     ),
 
-    # Stage 6 (50K-60K): Light noise (balanced mix)
+    # Stage 9 (65K-75K): Heavy mixing
     CurriculumStage(
-        name="stage_6_light_noise",
+        name="stage_9_heavy_mix",
         steps=10000,
         min_length=7,
         max_length=16,
-        noise_peaks=2,       # Light noise
-        peak_dropout=0.0,    # STILL no dropout
-        mass_error_ppm=2.0,
-        clean_data_ratio=0.6,  # 60% clean, 40% noisy
-        spectrum_loss_weight=0.13,
+        noise_peaks=5,
+        peak_dropout=0.0,
+        mass_error_ppm=8.0,
+        clean_data_ratio=0.3,
+        spectrum_loss_weight=0.20,
         precursor_loss_weight=0.05,
     ),
 
-    # Stage 7 (60K-70K): Moderate noise (mostly noisy)
+    # ========================================================================
+    # PHASE 4: FULL REALISM (75K-100K)
+    # ========================================================================
+
+    # Stage 10 (75K-87.5K): Near-realistic + dropout
     CurriculumStage(
-        name="stage_7_moderate_noise",
-        steps=10000,
+        name="stage_10_near_realistic",
+        steps=12500,
         min_length=7,
-        max_length=17,
-        noise_peaks=3,       # Moderate noise
-        peak_dropout=0.0,    # STILL no dropout
-        mass_error_ppm=5.0,
-        clean_data_ratio=0.4,  # 40% clean, 60% noisy
-        spectrum_loss_weight=0.14,
+        max_length=18,
+        noise_peaks=7,
+        peak_dropout=0.08,
+        mass_error_ppm=12.0,
+        intensity_variation=0.1,
+        clean_data_ratio=0.1,
+        spectrum_loss_weight=0.22,
         precursor_loss_weight=0.06,
     ),
 
-    # Stage 8 (70K-80K): Heavy noise + introduce dropout
+    # Stage 11 (87.5K-100K): Fully realistic
     CurriculumStage(
-        name="stage_8_heavy_noise",
-        steps=10000,
-        min_length=7,
-        max_length=18,
-        noise_peaks=5,       # Heavy noise
-        peak_dropout=0.05,   # FIRST TIME: Minimal dropout
-        mass_error_ppm=8.0,
-        clean_data_ratio=0.2,  # 20% clean, 80% noisy
-        spectrum_loss_weight=0.14,
-        precursor_loss_weight=0.07,
-    ),
-
-    # Stage 9 (80K-90K): Near-realistic
-    CurriculumStage(
-        name="stage_9_near_realistic",
-        steps=10000,
+        name="stage_11_realistic",
+        steps=12500,
         min_length=7,
         max_length=20,
-        noise_peaks=7,       # High noise
-        peak_dropout=0.08,   # Moderate dropout
-        mass_error_ppm=12.0,
-        intensity_variation=0.1,
-        clean_data_ratio=0.1,  # 10% clean, 90% noisy
-        spectrum_loss_weight=0.15,
-        precursor_loss_weight=0.08,
-    ),
-
-    # Stage 10 (90K-100K): Fully realistic
-    CurriculumStage(
-        name="stage_10_realistic",
-        steps=10000,
-        min_length=7,
-        max_length=20,
-        noise_peaks=10,      # Maximum noise
-        peak_dropout=0.10,   # Realistic dropout
+        noise_peaks=10,
+        peak_dropout=0.10,
         mass_error_ppm=15.0,
         intensity_variation=0.2,
-        clean_data_ratio=0.0,  # 100% noisy - full realism
-        spectrum_loss_weight=0.15,
+        clean_data_ratio=0.0,
+        spectrum_loss_weight=0.25,
         precursor_loss_weight=0.08,
     ),
 ]
@@ -206,7 +238,7 @@ class CurriculumScheduler:
         stages: list[CurriculumStage] = None,
         dataset: SyntheticPeptideDataset = None,
     ):
-        self.stages = stages or EXTENDED_CURRICULUM
+        self.stages = stages or DELAYED_SPECTRUM_CURRICULUM
         self.dataset = dataset
         self.current_stage_idx = -1
         self._cumulative_steps = self._compute_cumulative_steps()

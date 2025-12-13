@@ -14,9 +14,9 @@ model:
 
 training:
   # Optimization (3x faster!)
-  learning_rate: 1.5e-4  # Slightly higher for larger batch
+  learning_rate: 1.5e-4  # Tuned for batch=96
   weight_decay: 0.01
-  batch_size: 96  # Safe for TRM's high memory usage (8 supervision + 6 latent steps)
+  batch_size: 80  # torch.compile needs headroom for CUDA graphs
   max_steps: 100000  # 2x longer training
   warmup_steps: 2000  # Proportional increase
 
@@ -24,12 +24,12 @@ training:
   use_amp: true
   amp_dtype: 'bfloat16'  # Use 'bfloat16' if available
 
-  # Gradient Accumulation (if batch too large)
-  gradient_accumulation_steps: 1
+  # Gradient Accumulation - DISABLED (not needed with batch=80)
+  gradient_accumulation_steps: 1  # No accumulation - direct batch of 80
 
-  # Model Compilation (DISABLED - not needed, saves memory)
-  use_compile: false
-  compile_mode: 'max-autotune'
+  # Model Compilation - TESTING with reduced batch size
+  use_compile: true  # TESTING: Lower batch might avoid OOM in CUDA graph capture
+  compile_mode: 'reduce-overhead'  # Best for recurrent models
 
   # Loss configuration
   ce_weight: 1.0
@@ -64,3 +64,26 @@ data:
   charge_distribution:
     2: 0.7
     3: 0.3
+
+# Real data validation - track performance on real data while training on synthetic
+# This helps detect if we're over-optimizing for simulation artifacts
+real_data_validation:
+  enabled: true
+  eval_interval: 2000  # Evaluate every N steps (less frequent than synthetic validation)
+
+  # ProteomeTools: Synthetic peptide library (high-quality, comprehensive)
+  proteometools:
+    enabled: true
+    data_dir: 'data/proteometools'
+    batch_size: 64
+    num_batches: 20  # Number of batches to evaluate (quick validation)
+    max_samples: 5000  # Only load 5K samples for fast validation
+
+  # Nine-Species: Real biological samples (9 species benchmark)
+  nine_species:
+    enabled: true
+    data_dir: 'data/nine_species'
+    batch_size: 64
+    num_batches: 20
+    max_samples: 5000  # Only load 5K samples for fast validation
+    use_balanced: true  # Use balanced version (780K PSMs, ~13GB extracted)
