@@ -29,7 +29,7 @@ from src.data.ms2pip_dataset import MS2PIPSyntheticDataset
 from src.data.proteometools_dataset import ProteomeToolsDataset
 from src.data.nine_species_dataset import NineSpeciesDataset
 from src.training.trainer_optimized import OptimizedTrainer, TrainingConfig
-from src.training.curriculum_aggressive_noise import CurriculumScheduler, AGGRESSIVE_NOISE_CURRICULUM
+from src.training.curriculum_complex_noise import CurriculumScheduler, AGGRESSIVE_NOISE_CURRICULUM
 
 
 def create_model(config: TRMConfig) -> RecursivePeptideModel:
@@ -147,12 +147,13 @@ def main():
     # Create curriculum scheduler
     curriculum = CurriculumScheduler(AGGRESSIVE_NOISE_CURRICULUM, train_dataset)
 
-    print("\n📚 Aggressive Noise Curriculum:")
+    print("\n📚 Two-Tier Noise Curriculum (Flat Length):")
     print(f"  Total stages: {len(AGGRESSIVE_NOISE_CURRICULUM)}")
     print(f"  Total steps: {sum(s.steps for s in AGGRESSIVE_NOISE_CURRICULUM):,}")
-    print(f"  Stage 1: 5 noise peaks, 15% dropout")
-    print(f"  Stage 3: 15 noise peaks, 30% dropout (realistic!)")
-    print(f"  Stage 6-7: 30 noise peaks, 45% dropout (extreme!)")
+    print(f"  Length: 7-30 from start (no progressive length)")
+    print(f"  Stage 0: Pure foundation (100% clean, all lengths)")
+    print(f"  Stage 1-2: Introduce grass + spikes noise")
+    print(f"  Stage 3-4: Realistic → Extreme stress test")
 
     # Custom collate function for MS2PIPSample dataclasses
     def collate_fn(batch):

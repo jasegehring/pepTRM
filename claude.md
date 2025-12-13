@@ -1,6 +1,6 @@
 # PepTRM: Recursive Transformer for De Novo Peptide Sequencing
-**Status**: Active Development | **Latest**: Aggressive noise training in progress
-**Last Updated**: December 12, 2024
+**Status**: Active Development | **Latest**: Two-tier noise curriculum (flat length + spikes)
+**Last Updated**: December 13, 2024
 
 ---
 
@@ -336,20 +336,52 @@ docs/
 
 **See `docs/MASTER_ROADMAP_2024-12-12.md` for complete details.**
 
-### **Phase 1: Unlock Multi-Step Recursion** (Weeks 1-2) 🔴 **CURRENT**
+### **Phase 1: Unlock Multi-Step Recursion** 🔴 **CURRENT**
 
-**Goal**: Prove model can use all 8 refinement steps
+**Goal**: Prove model can use all 8 refinement steps + achieve length generalization
 
-**In Progress**:
-- ⏳ Aggressive noise training (exponential weighting + noise curriculum)
-- ⏳ Monitor per-step losses: Does ce_step_7 < ce_step_0?
+**Current Experiment** (Dec 13):
+- ⏳ Two-tier noise curriculum (`curriculum_complex_noise.py`)
+  - Flat length 7-30 from step 0 (no progressive length)
+  - "Grass" noise (low-intensity background) + "Spikes" (high-intensity decoys)
+  - Signal suppression (crush real peaks to break intensity bias)
+  - Pure foundation phase (5K steps, 100% clean, all lengths)
+- ⏳ DataLoader iterator bug FIXED (workers now see curriculum updates)
+- ⏳ Monitor: length-bucketed accuracy, val_hard, real data transfer
+
+**Previous Run Learnings** (36K steps):
+- ✅ Bug fix working (better val_hard performance)
+- ⚠️ Short peptides plateau early (positional overfitting)
+- ⚠️ Long peptides struggle (introduced too late)
+- 📈 ProteomeTools reached 12% token acc (better than before!)
 
 **If Current Run Fails**:
 - 🔲 Implement step embeddings (tell model which iteration it's on)
 - 🔲 Fix residual format for answer_step (learn deltas, not states)
 - 🔲 Integrate refinement tracker (monitor sequence changes per step)
 
-### **Phase 2: Advanced Architecture Features** (Weeks 3-4)
+### **Phase 1.5: Architecture Experiments** (After curriculum validated)
+
+**Experiment: Perception-Heavy Architecture**
+```yaml
+# Hypothesis: Bigger encoder for noisy spectra, smaller decoder for fast iteration
+hidden_dim: 384        # Keep
+num_heads: 6           # Keep
+encoder_layers: 6      # INCREASE (was 3) - Better noise parsing
+decoder_layers: 2      # DECREASE (was 3) - Faster recursive loop
+supervision_steps: 8   # Keep
+latent_steps: 4        # DECREASE (was 6) - Peptide logic may need less
+```
+- Rationale: Spectrum parsing is hard (150+ noise peaks), sequence logic is constrained by mass
+- Tradeoff: ~15M params, 32 thinking steps (vs 12.5M, 48 steps)
+- Test AFTER proving curriculum works
+
+**Experiment: Tiny TRM Challenge**
+- Can we match Casanovo (47M) with <5M params?
+- Slim config: hidden=256, enc=2, dec=2 → 3.7M params
+- Test AFTER architecture experiments
+
+### **Phase 2: Advanced Architecture Features**
 
 **Mass Gap Token** (for unknown modifications):
 - Add `[GAP]` token to vocabulary
