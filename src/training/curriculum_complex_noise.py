@@ -217,8 +217,16 @@ class CurriculumScheduler:
     def get_current_stage(self) -> CurriculumStage:
         return self.stages[self.current_stage_idx]
 
+    @property
+    def current_stage(self) -> CurriculumStage:
+        """Property for compatibility with trainer."""
+        return self.stages[self.current_stage_idx]
+
     def get_precursor_loss_weight(self) -> float:
         return self.stages[self.current_stage_idx].precursor_loss_weight
+
+    def get_spectrum_loss_weight(self) -> float:
+        return self.stages[self.current_stage_idx].spectrum_loss_weight
         
     def _log_stage_transition(self, stage: CurriculumStage, idx: int):
         print(f"\n🚀 CURRICULUM UPDATE: Stage {idx + 1}/{len(self.stages)} - {stage.name}")
