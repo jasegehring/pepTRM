@@ -20,6 +20,8 @@ from typing import Optional
 from dataclasses import dataclass
 from copy import deepcopy
 from tqdm import tqdm
+import json
+from datetime import datetime
 
 from ..model.trm import RecursivePeptideModel
 from .losses import DeepSupervisionLoss, CombinedLoss
@@ -233,6 +235,14 @@ class OptimizedTrainer:
         # Checkpoint directory
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Local metrics logging (for analysis without wandb)
+        self.metrics_log_path = Path('logs')
+        self.metrics_log_path.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.metrics_file = self.metrics_log_path / f'metrics_{timestamp}.jsonl'
+        self.local_log_interval = 1000  # Log locally every 1000 steps (downsampled)
+        print(f"📝 Local metrics log: {self.metrics_file}")
 
         # Initialize wandb
         if self.use_wandb:
@@ -489,6 +499,34 @@ class OptimizedTrainer:
 
                     wandb.log(log_dict, step=self.global_step)
 
+                # Local metrics logging (downsampled for efficiency)
+                if self.global_step % self.local_log_interval == 0:
+                    local_record = {
+                        'step': self.global_step,
+                        'timestamp': datetime.now().isoformat(),
+                        'loss': loss,
+                        'token_accuracy': metrics.get('token_accuracy', 0),
+                        'sequence_accuracy': metrics.get('sequence_accuracy', 0),
+                        'lr': self.scheduler.get_last_lr()[0],
+                    }
+                    # Add per-step CE losses
+                    for i in range(8):
+                        key = f'ce_step_{i}'
+                        if key in metrics:
+                            local_record[key] = metrics[key]
+                    # Add recursion metrics
+                    for k, v in metrics.items():
+                        if k.startswith('recursion/'):
+                            local_record[k] = v
+                    # Add curriculum info
+                    if self.curriculum and self.curriculum.current_stage:
+                        stage = self.curriculum.current_stage
+                        local_record['curriculum_stage'] = self.curriculum.current_stage_idx
+                        local_record['curriculum_name'] = stage.name
+
+                    with open(self.metrics_file, 'a') as f:
+                        f.write(json.dumps(local_record) + '\n')
+
             # Validation
             if self.global_step % self.config.eval_interval == 0:
                 # Easy validation (clean data, short peptides)
@@ -523,6 +561,21 @@ class OptimizedTrainer:
                         wandb.log({
                             f'val_hard/{k}': v for k, v in val_hard_metrics.items()
                         }, step=self.global_step)
+
+                # Local validation logging
+                val_record = {
+                    'step': self.global_step,
+                    'timestamp': datetime.now().isoformat(),
+                    'type': 'validation',
+                }
+                if self.val_loader_easy is not None:
+                    val_record['val_easy_token_acc'] = val_easy_metrics['token_accuracy']
+                    val_record['val_easy_seq_acc'] = val_easy_metrics['sequence_accuracy']
+                if self.val_loader_hard is not None:
+                    val_record['val_hard_token_acc'] = val_hard_metrics['token_accuracy']
+                    val_record['val_hard_seq_acc'] = val_hard_metrics['sequence_accuracy']
+                with open(self.metrics_file, 'a') as f:
+                    f.write(json.dumps(val_record) + '\n')
 
             # Real data validation (less frequent)
             if self.global_step % self.real_data_eval_interval == 0:

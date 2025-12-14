@@ -1,6 +1,6 @@
 # PepTRM: Recursive Transformer for De Novo Peptide Sequencing
-**Status**: Active Development | **Latest**: Two-tier noise curriculum (flat length + spikes)
-**Last Updated**: December 13, 2024
+**Status**: Active Development | **Latest**: Step embeddings + gated residuals implemented
+**Last Updated**: December 13, 2024 (Architecture v2.1)
 
 ---
 
@@ -22,21 +22,31 @@
 
 ## Architecture Overview
 
-### Core TRM Loop
+### Core TRM Loop (v2.1 - with Step Embeddings & Gated Residuals)
 
 ```
 Initialize: y₀ (sequence logits), z₀ (latent state)
 
-For each supervision step t ∈ {1, ..., 8}:
-    For n=6 latent reasoning steps:
-        z = LayerNorm(z + TransformerBlock(z, spectrum_encoding))  # Think
+For each supervision step t ∈ {0, ..., 7}:
+    step_emb = StepEmbedding(t)     # NEW: Model knows which iteration it's on
 
-    y = OutputHead(z)  # Act
+    For n=6 latent reasoning steps:
+        z = LayerNorm(z + TransformerBlock(z + step_emb, spectrum_encoding))  # Think
+
+    # NEW: GRU-style gated residual (not just OutputHead)
+    candidate = OutputHead(z + step_emb)
+    gate = Sigmoid(GateHead(z + step_emb))  # gate ∈ [0,1], initialized conservative
+    y = (1 - gate) * y_prev + gate * candidate  # Interpolate prev and new
 
     Loss_t = CrossEntropy(y, target) + λ_precursor * PrecursorLoss(y, precursor_mass)
 
 Total Loss = Σ_t w_t * Loss_t     # Deep supervision with exponential weighting
 ```
+
+**Key v2.1 Improvements**:
+- **Step embeddings**: Model knows "am I on step 0 (rough draft) or step 7 (polishing)?"
+- **Gated residuals**: Model decides per-position how much to update vs keep previous
+- **Conservative init**: Gate bias = -2.0, so initial gate ≈ 12% (must "earn" right to change)
 
 **Key Components**:
 - **Spectrum Encoding** (x): MS/MS peaks (m/z + intensities) encoded via Transformer
@@ -108,20 +118,28 @@ Output: Refined sequence prediction
 
 ### 🔄 **In Progress**
 
-**Active Training Run** (Aggressive Noise Curriculum):
-- Testing hypothesis: "Does noise unlock multi-step refinement?"
-- Exponential iteration weighting (force step 7 optimization)
-- Clean/noisy mixing: 80% clean → 0% clean over 45K steps
-- Precursor loss: 0.05 → 0.3 over training
-- **Goal**: See refinement across ALL 8 steps, not just step 0→1
+**Architecture v2.1** (Step Embeddings + Gated Residuals) - JUST IMPLEMENTED:
+- ✅ Step embeddings: Model knows iteration index (0-7)
+- ✅ GRU-style gated residuals in answer_step
+- ✅ Gate initialized conservative (bias=-2.0, ~12% initial activation)
+- ✅ Local metrics logging (logs/metrics_*.jsonl)
+- ✅ Analysis tool (tools/analyze_runs.py)
+- **Next**: Train and validate that recursion plateau is fixed
+- **Goal**: See progressive improvement across ALL 8 steps
+
+**Previous Run** (Aggressive Noise Curriculum at 57K steps):
+- Recursion plateau confirmed (steps 1-6 all similar loss)
+- val_hard at 90% while training at 30% (curriculum harder than validation)
+- ProteomeTools: 11% token accuracy (better than random but struggling)
 
 ### ❌ **Known Challenges**
 
-1. **Recursion Plateau** 🔴 **HIGH PRIORITY**
+1. **Recursion Plateau** 🟡 **FIX IMPLEMENTED - NEEDS TESTING**
    - Model refines step 0→1 (loss: 0.98 → 0.83) ✅
    - But plateaus steps 2-7 (all ~0.82 loss) ❌
    - Only using ~2 of 8 available refinement steps
-   - **Current hypothesis**: Linear weighting insufficient, noise too gentle
+   - **Fix implemented**: Step embeddings + GRU-style gated residuals (v2.1)
+   - **Next**: Train and validate the fix works
 
 2. **Spectrum Loss Challenges**
    - Stuck at 94-96% with sigma=0.2 Da (only 4-6% coverage)
@@ -320,6 +338,15 @@ scripts/
 └── overfit_test.py           # Validation test
 ```
 
+**Analysis Tools**:
+```
+tools/
+└── analyze_runs.py           # Parse wandb & local logs
+                              # --live, --run <ID>, --local, --compare
+logs/
+└── metrics_*.jsonl           # Local metrics (every 1000 steps)
+```
+
 **Documentation**:
 ```
 docs/
@@ -355,9 +382,10 @@ docs/
 - ⚠️ Long peptides struggle (introduced too late)
 - 📈 ProteomeTools reached 12% token acc (better than before!)
 
-**If Current Run Fails**:
-- 🔲 Implement step embeddings (tell model which iteration it's on)
-- 🔲 Fix residual format for answer_step (learn deltas, not states)
+**Architecture v2.1 (Just Implemented)**:
+- ✅ Step embeddings (model knows iteration 0-7)
+- ✅ GRU-style gated residuals (conservative gate init, ~12% activation)
+- 🔲 Train and validate recursion plateau is fixed
 - 🔲 Integrate refinement tracker (monitor sequence changes per step)
 
 ### **Phase 1.5: Architecture Experiments** (After curriculum validated)
@@ -529,8 +557,8 @@ train/spectrum_loss:    # Spectrum matching (disabled for now)
 **"Model not refining past step 1"**:
 - ✅ Switch to exponential weighting
 - ✅ Increase noise difficulty (force model to need recursion)
-- 🔲 Add step embeddings (tell model which iteration it's on)
-- 🔲 Fix residual format (learn deltas, not states)
+- ✅ Add step embeddings (model knows iteration 0-7)
+- ✅ GRU-style gated residuals (conservative init, ~12% gate activation)
 
 **"Spectrum loss stuck at 95%"**:
 - ✅ Disable for now (sigma too narrow)
@@ -597,5 +625,5 @@ MIT - See LICENSE file
 - 🔬 [Training Guide](docs/training_with_real_data.md)
 - ⚙️ [Memory Optimization](docs/memory_management.md)
 
-**Status**: Active development, aggressive noise training in progress
-**Next Milestone**: Unlock multi-step recursion (Phases 1-2)
+**Status**: Active development, architecture v2.1 ready for training
+**Next Milestone**: Validate step embeddings + gated residuals fix recursion plateau

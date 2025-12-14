@@ -41,50 +41,31 @@
   - No catastrophic drops between curriculum stages
 - **If Fails**: Move to Priority 1.2 (architectural improvements)
 
-#### Priority 1.2: Implement Step Embeddings ⭐⭐⭐ **HIGH PRIORITY**
+#### Priority 1.2: Implement Step Embeddings ✅ **COMPLETED 2024-12-13**
 **Why**: Tell model which refinement step it's on (rough draft vs polishing)
 
-**Implementation**:
+**Implementation**: Added `step_embedding = nn.Embedding(8, hidden_dim)` to RecursiveDecoder.
+Step embedding is injected into both `latent_step` and `answer_step` via:
 ```python
-# Add to RecursiveCore.__init__:
-self.step_embedding = nn.Embedding(num_supervision_steps + 1, hidden_dim)
-
-# In forward loop:
-step_emb = self.step_embedding(torch.tensor(step, device=device))
-z = z + step_emb.unsqueeze(0).unsqueeze(0)  # Inject into latent state
+x = y_embed + latent_z + pos_embed + step_emb
 ```
 
 **Precedent**: Diffusion models, DDPM, iterative refinement literature
-**Effort**: Very easy (~10 lines of code)
-**Impact**: High - proven in other recursive models
 
-#### Priority 1.3: Fix Residual Format for Answer Step ⭐⭐⭐ **CRITICAL**
+#### Priority 1.3: Fix Residual Format for Answer Step ✅ **COMPLETED 2024-12-13**
 **Why**: Current architecture only partially uses residuals
 
-**Current Issue**:
-- `latent_step`: ✅ Has residual (`z = norm(z + delta)`)
-- `answer_step`: ❌ No residual (`y = output_head(x)` - full state prediction)
-
-**Fix**:
+**Solution Implemented**: GRU-style gated residual (safer than direct delta):
 ```python
-# In decoder.py answer_step, change from:
-y_logits = self.output_head(x)  # Predicts full state
-
-# To:
-y_delta = self.output_head(x)   # Predicts change
-y_logits = y_logits + y_delta    # Apply delta (residual update)
+# In answer_step:
+candidate_logits = self.output_head(x)           # New hypothesis
+gate = torch.sigmoid(self.gate_head(x))          # Confidence [0,1]
+new_logits = (1 - gate) * prev_logits + gate * candidate_logits
 ```
 
-**Alternative** (safer):
-```python
-# Gated residual (learned interpolation)
-y_delta = self.output_head(x)
-gate = torch.sigmoid(self.gate_head(x))  # New learnable gate
-y_logits = (1 - gate) * y_logits + gate * y_delta
-```
-
-**Effort**: Medium (requires careful logits handling)
-**Impact**: High - prevents fixed-point convergence
+- Gate bias initialized to -2.0 (conservative start, gate ≈ 0.12)
+- Forces model to "earn" the right to make changes
+- Bounded updates (no exploding deltas)
 
 #### Priority 1.4: Implement Refinement Tracker Integration 📊
 **Why**: Monitor how sequences change across steps (already created, need to integrate)
@@ -612,6 +593,77 @@ y_doubly = (y_masses + 2 * PROTON_MASS) / 2
 - ⏸️ **Glycosylation**: Very complex modifications
 - ⏸️ **De novo assembly**: Protein-level inference
 
+### **Queued for Testing (Post Step Embeddings)**
+
+#### Priority A: Multi-Point Step Embedding Injection ⭐⭐
+**Why**: In diffusion models, timestep embeddings are injected at every layer, not just the input.
+Currently we add step_emb once at input fusion. Better approach: inject into each transformer layer.
+
+**Implementation**:
+```python
+# In TransformerDecoderLayer:
+def forward(self, x, context, step_emb=None):
+    if step_emb is not None:
+        x = x + step_emb  # Inject at each layer
+    # ... rest of layer
+```
+
+**Effort**: Medium (modify transformer layers)
+**Expected Impact**: Stronger step-awareness, better differentiation between early/late steps
+
+#### Priority B: pLDDT-Style Confidence Head ⭐⭐⭐
+**Why**: Know which positions are confident vs uncertain (like AlphaFold's pLDDT).
+
+**Implementation**:
+```python
+# Add confidence head to decoder
+self.confidence_head = nn.Sequential(
+    nn.Linear(hidden_dim, hidden_dim // 2),
+    nn.ReLU(),
+    nn.Linear(hidden_dim // 2, 1),
+    nn.Sigmoid()
+)
+
+# During training: target is per-position correctness (1 if correct, 0 if wrong)
+confidence_target = (predictions == targets).float()
+confidence_loss = F.binary_cross_entropy(confidence_pred, confidence_target)
+
+# During inference: color-code output
+# "PEPTIDE" where P is red (uncertain, confidence<0.5) and EPTIDE is blue (confident)
+```
+
+**Use Cases**:
+- Filter uncertain positions during inference
+- Prioritize manual validation of low-confidence regions
+- Quality control for downstream analysis
+
+**Effort**: Easy-Medium
+**Expected Impact**: High for production use, interpretability
+
+#### Priority C: Noise/Curriculum Conditioning ⭐⭐
+**Why**: Tell the model about data quality ("Greedy Mode" vs "Careful Mode").
+
+**Implementation**:
+```python
+# Add noise level embedding (indexed by curriculum stage or estimated SNR)
+self.noise_embedding = nn.Embedding(num_curriculum_stages, hidden_dim)
+
+# In forward loop, inject alongside step embedding:
+noise_emb = self.noise_embedding(curriculum_stage_idx)
+x = y_embed + latent_z + pos_embed + step_emb + noise_emb
+```
+
+**Alternative**: Estimate SNR from spectrum statistics (peak count, intensity distribution)
+and use continuous embedding.
+
+**Use Cases**:
+- Model adapts processing based on data quality
+- Cleaner data → more confident, noisier data → more cautious
+- Could improve sim-to-real transfer
+
+**Effort**: Easy
+**Expected Impact**: Medium (especially for curriculum training)
+
 ---
 
 ## 📊 Metrics Dashboard
@@ -651,13 +703,24 @@ y_doubly = (y_masses + 2 * PROTON_MASS) / 2
 
 ---
 
-**Last Updated**: 2024-12-12
-**Next Review**: After aggressive noise training completes (~24 hours)
+**Last Updated**: 2024-12-13
+**Next Review**: After step embeddings + gated residuals training run
 **Maintainer**: Development team
 
 ---
 
 ## 📝 Change Log
+
+**v2.1 (2024-12-13)**:
+- ✅ **IMPLEMENTED: Step Embeddings** - Model now knows which refinement iteration it's on (0-7)
+- ✅ **IMPLEMENTED: Gated Residuals** - GRU-style update in answer_step: `new = (1-gate)*prev + gate*candidate`
+  - Gate initialized to -2.0 (conservative start, ~12% initial gate activation)
+  - Forces model to "earn" the right to make changes
+- Added local metrics logging to trainer (logs/metrics_*.jsonl)
+- Added analyze_runs.py tool for parsing training metrics
+- Added future ideas to roadmap: multi-point injection, pLDDT confidence, noise conditioning
+- Parameter count: 12,482,816 → 12,495,128 (+12K for step_emb + gate_head)
+- **NOTE**: Old checkpoints are NOT compatible with new model architecture
 
 **v2.0 (2024-12-12)**:
 - Consolidated all previous roadmaps and proposals

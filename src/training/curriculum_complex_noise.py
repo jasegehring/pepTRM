@@ -132,21 +132,40 @@ AGGRESSIVE_NOISE_CURRICULUM = [
         precursor_loss_weight=0.20, # Physics is now critical
     ),
 
-    # Stage 4: The Stress Test (Haystack Mode)
+    # Stage 4: Bridge (Smooth Transition)
+    # Goal: Prevent shock from Stage 3 → 5. Gradually ramp difficulty.
+    CurriculumStage(
+        name="Bridge to Stress Test",
+        steps=10000,
+        min_length=7,
+        max_length=30,
+        clean_data_ratio=0.1,    # Almost gone, but small safety net
+
+        noise_peaks_low=100,     # Ramp: 50 → 100 → 150
+        noise_peaks_high=7,      # Ramp: 5 → 7 → 10
+        peak_dropout=0.40,       # Ramp: 0.30 → 0.40 → 0.50
+        signal_suppression=0.25, # Ramp: 0.20 → 0.25 → 0.30
+
+        mass_error_ppm=12.0,
+        intensity_variation=0.45,
+        precursor_loss_weight=0.25,
+    ),
+
+    # Stage 5: The Stress Test (Haystack Mode)
     # Goal: Force the model to use Recursive Refinement and Precursor Constraints.
     # If the model can solve this, Real Data will feel easy.
     CurriculumStage(
         name="Extreme Stress Test",
-        steps=55000,             # Long tail training
+        steps=45000,             # Long tail training (reduced since we added bridge)
         min_length=7,
         max_length=30,
         clean_data_ratio=0.0,    # Zero crutches. Sink or swim.
-        
+
         noise_peaks_low=150,     # Massive haystack (realistic for complex samples)
         noise_peaks_high=10,     # Very messy spectrum
         peak_dropout=0.50,       # Missing HALF the sequence evidence
         signal_suppression=0.30, # Heavy suppression
-        
+
         mass_error_ppm=15.0,
         intensity_variation=0.5,
         precursor_loss_weight=0.30, # MAX PHYSICS: "Trust the mass, not the eyes"

@@ -59,7 +59,7 @@ class RecursivePeptideModel(nn.Module):
             dropout=config.dropout,
         )
 
-        # Recursive decoder core
+        # Recursive decoder core (v2: with step embeddings and gated residuals)
         self.recursive_core = RecursiveCore(
             hidden_dim=config.hidden_dim,
             num_layers=config.num_decoder_layers,
@@ -67,6 +67,7 @@ class RecursivePeptideModel(nn.Module):
             max_seq_len=config.max_seq_len,
             vocab_size=config.vocab_size,
             num_latent_steps=config.num_latent_steps,
+            num_supervision_steps=config.num_supervision_steps,
             dropout=config.dropout,
         )
 
