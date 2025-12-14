@@ -71,6 +71,9 @@ class RecursiveDecoder(nn.Module):
         # Outputs per-position, per-vocab gate values in [0, 1]
         # gate=0: keep previous, gate=1: use new candidate
         self.gate_head = nn.Linear(hidden_dim, vocab_size)
+        # Zero-init weights so gates are CONSISTENT at init (not noisy)
+        # Without this, gates range from 2%-52% at init instead of uniform 12%
+        nn.init.zeros_(self.gate_head.weight)
         # Initialize gate bias to -2.0 (starts conservative, ~sigmoid(-2)=0.12)
         # Forces model to initially rely on previous step, only update when confident
         nn.init.constant_(self.gate_head.bias, -2.0)
